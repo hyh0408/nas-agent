@@ -1,0 +1,28 @@
+FROM python:3.11-slim
+
+# Install Docker CLI (공식 바이너리 직접 설치)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    curl git ca-certificates gnupg && \
+    # Docker CLI 바이너리 직접 다운로드
+    curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.4.1.tgz | \
+    tar xz --strip-components=1 -C /usr/local/bin docker/docker && \
+    # Node.js 20 설치 (Claude Code CLI 필수)
+    curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code CLI
+RUN npm install -g @anthropic-ai/claude-code
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY bot/ ./bot/
+COPY executor/ ./executor/
+
+EXPOSE 9100
+
+CMD ["python", "-m", "bot.main"]
