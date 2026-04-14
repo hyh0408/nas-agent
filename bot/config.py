@@ -12,7 +12,7 @@ class Config:
         for uid in os.environ.get("ALLOWED_USER_IDS", "").split(",")
         if uid.strip()
     ]
-    CLAUDE_CLI_PATH: str = os.environ.get("CLAUDE_CLI_PATH", "/root/.claude/local/claude")
+    CLAUDE_CLI_PATH: str = os.environ.get("CLAUDE_CLI_PATH", "/usr/bin/claude")
     PROJECTS_DIR: str = os.environ.get("PROJECTS_DIR", "/app/projects")
     NAS_HOST: str = os.environ.get("NAS_HOST", "nas.local")
     HEALTH_PORT: int = int(os.environ.get("HEALTH_PORT", "9100"))

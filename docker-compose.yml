@@ -8,10 +8,6 @@ services:
     network_mode: bridge
     env_file:
       - .env
-    environment:
-      - CLAUDE_CLI_PATH=/root/.claude/local/claude
-      - PROJECTS_DIR=/app/projects
-      - HEALTH_PORT=9100
     volumes:
       # Docker 소켓 - 호스트 Docker를 컨테이너에서 제어
       - /run/docker.sock:/var/run/docker.sock
