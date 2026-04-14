@@ -12,6 +12,7 @@ Respond ONLY with valid JSON, no other text.
 
 Categories:
 - {"type": "simple", "action": "status"} — check container status
+- {"type": "simple", "action": "system_status"} — check NAS host CPU, memory, disk
 - {"type": "simple", "action": "logs", "target": "<container>"} — view logs
 - {"type": "simple", "action": "deploy", "target": "<project>"} — deploy existing project
 - {"type": "simple", "action": "stop", "target": "<container>"} — stop container
@@ -22,6 +23,8 @@ Categories:
 
 Examples:
 User: "상태 보여줘" → {"type": "simple", "action": "status"}
+User: "CPU 메모리 상태" → {"type": "simple", "action": "system_status"}
+User: "NAS 리소스 확인" → {"type": "simple", "action": "system_status"}
 User: "myapp 로그 보여줘" → {"type": "simple", "action": "logs", "target": "myapp"}
 User: "FastAPI로 할일 앱 만들어줘" → {"type": "complex", "description": "FastAPI로 할일 관리 API 앱을 만들어서 Docker로 배포"}
 User: "안녕" → {"type": "chat", "message": "안녕하세요! NAS 관리 봇입니다. 무엇을 도와드릴까요?"}

@@ -20,6 +20,7 @@ from executor.docker_exec import (
     container_restart,
     deploy_project,
     list_projects,
+    system_status,
 )
 from executor.claude_exec import run_claude
 
@@ -50,6 +51,7 @@ async def cmd_start(update: Update, context):
     await update.message.reply_text(
         "NAS Agent Bot 입니다.\n\n"
         "사용 가능한 명령:\n"
+        "/sys - NAS 리소스 상태 (CPU/메모리/디스크)\n"
         "/status - 컨테이너 상태\n"
         "/logs <이름> - 컨테이너 로그\n"
         "/deploy <프로젝트> - 프로젝트 배포\n"
@@ -108,6 +110,12 @@ async def cmd_restart(update: Update, context):
 
 
 @authorized
+async def cmd_sys(update: Update, context):
+    result = await system_status()
+    await update.message.reply_text(f"```\n{result}\n```", parse_mode="Markdown")
+
+
+@authorized
 async def cmd_projects(update: Update, context):
     result = await list_projects(Config.PROJECTS_DIR)
     await update.message.reply_text(f"프로젝트 목록:\n```\n{result}\n```", parse_mode="Markdown")
@@ -150,6 +158,10 @@ async def _handle_simple(update: Update, cmd: dict):
 
     if action == "status":
         result = await container_status()
+        await update.message.reply_text(f"```\n{result}\n```", parse_mode="Markdown")
+
+    elif action == "system_status":
+        result = await system_status()
         await update.message.reply_text(f"```\n{result}\n```", parse_mode="Markdown")
 
     elif action == "logs":
@@ -229,6 +241,7 @@ def main():
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("projects", cmd_projects))
+    app.add_handler(CommandHandler("sys", cmd_sys))
 
     # 자연어 메시지 핸들러
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
