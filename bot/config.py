@@ -6,7 +6,7 @@ load_dotenv()
 
 class Config:
     TELEGRAM_BOT_TOKEN: str = os.environ["TELEGRAM_BOT_TOKEN"]
-    ANTHROPIC_API_KEY: str = os.environ["ANTHROPIC_API_KEY"]
+    ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
     ALLOWED_USER_IDS: list[int] = [
         int(uid.strip())
         for uid in os.environ.get("ALLOWED_USER_IDS", "").split(",")

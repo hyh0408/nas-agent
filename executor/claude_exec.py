@@ -22,7 +22,7 @@ async def run_claude(prompt: str, work_dir: str | None = None) -> str:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
-        env={**os.environ, "ANTHROPIC_API_KEY": Config.ANTHROPIC_API_KEY},
+        env={**os.environ},
     )
 
     try:
