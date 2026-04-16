@@ -1,52 +1,68 @@
-"""Haiku 기반 명령 분류기 - 토큰 최소 소비"""
+"""룰 기반 명령 분류기 - API 호출 없이 정규식으로 분류"""
 
-import json
-import anthropic
-from bot.config import Config
+import re
 
-SYSTEM_PROMPT = """\
-You are a command classifier for a Synology NAS automation bot.
-Classify the user's message into one of these categories.
 
-Respond ONLY with valid JSON, no other text.
+GREETING = re.compile(r"^\s*(안녕|하이|헬로|hi|hello|ㅎㅇ)\b", re.IGNORECASE)
 
-Categories:
-- {"type": "simple", "action": "status"} — check container status
-- {"type": "simple", "action": "system_status"} — check NAS host CPU, memory, disk
-- {"type": "simple", "action": "logs", "target": "<container>"} — view logs
-- {"type": "simple", "action": "deploy", "target": "<project>"} — deploy existing project
-- {"type": "simple", "action": "stop", "target": "<container>"} — stop container
-- {"type": "simple", "action": "restart", "target": "<container>"} — restart container
-- {"type": "simple", "action": "list_projects"} — list available projects
-- {"type": "complex", "description": "<what the user wants>"} — code generation, new app creation, debugging, or anything requiring AI reasoning
-- {"type": "chat", "message": "<friendly response>"} — casual conversation, greetings
+SYSTEM_STATUS = re.compile(
+    r"(cpu|메모리|memory|디스크|disk|리소스|resource|시스템\s*상태|nas\s*상태|\bsys\b)",
+    re.IGNORECASE,
+)
 
-Examples:
-User: "상태 보여줘" → {"type": "simple", "action": "status"}
-User: "CPU 메모리 상태" → {"type": "simple", "action": "system_status"}
-User: "NAS 리소스 확인" → {"type": "simple", "action": "system_status"}
-User: "myapp 로그 보여줘" → {"type": "simple", "action": "logs", "target": "myapp"}
-User: "FastAPI로 할일 앱 만들어줘" → {"type": "complex", "description": "FastAPI로 할일 관리 API 앱을 만들어서 Docker로 배포"}
-User: "안녕" → {"type": "chat", "message": "안녕하세요! NAS 관리 봇입니다. 무엇을 도와드릴까요?"}
-"""
+LIST_PROJECTS = re.compile(
+    r"(프로젝트\s*목록|프로젝트들|project\s*list|list\s*project)",
+    re.IGNORECASE,
+)
 
-client = anthropic.Anthropic(api_key=Config.ANTHROPIC_API_KEY)
+CONTAINER_STATUS = re.compile(
+    r"(컨테이너\s*상태|container\s*status|^\s*상태)",
+    re.IGNORECASE,
+)
+
+# "로그" 는 블로그/카탈로그/다이얼로그 등 합성어에 자주 포함되므로 한글 접두사가
+# 앞에 붙지 않은 경우에만 인정한다. 다른 키워드들은 접두사 충돌 사례가 드물다.
+LOGS = re.compile(r"(?<![가-힣])로그|\blogs?\b", re.IGNORECASE)
+DEPLOY = re.compile(r"배포|\bdeploy\b", re.IGNORECASE)
+STOP = re.compile(r"(중지|정지|멈춰|종료)|\bstop\b", re.IGNORECASE)
+RESTART = re.compile(r"(재시작|리스타트)|\brestart\b", re.IGNORECASE)
+
+TARGET_TOKEN = re.compile(r"[a-zA-Z][a-zA-Z0-9_-]+")
+
+
+def _extract_target(text: str, keyword_pattern: re.Pattern) -> str:
+    cleaned = keyword_pattern.sub(" ", text)
+    tokens = TARGET_TOKEN.findall(cleaned)
+    return tokens[0] if tokens else ""
 
 
 async def classify(message: str) -> dict:
-    """메시지를 분류하고 JSON 딕셔너리를 반환한다."""
-    response = client.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=300,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": message}],
-    )
-    text = response.content[0].text.strip()
+    text = message.strip()
 
-    # JSON 블록이 ```로 감싸져 있을 수 있음
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
+    if GREETING.search(text):
+        return {
+            "type": "chat",
+            "message": "안녕하세요! NAS 관리 봇입니다. 무엇을 도와드릴까요?",
+        }
 
-    return json.loads(text)
+    if SYSTEM_STATUS.search(text):
+        return {"type": "simple", "action": "system_status"}
+
+    if LIST_PROJECTS.search(text):
+        return {"type": "simple", "action": "list_projects"}
+
+    for pattern, action in (
+        (LOGS, "logs"),
+        (DEPLOY, "deploy"),
+        (STOP, "stop"),
+        (RESTART, "restart"),
+    ):
+        if pattern.search(text):
+            target = _extract_target(text, pattern)
+            if target:
+                return {"type": "simple", "action": action, "target": target}
+
+    if CONTAINER_STATUS.search(text):
+        return {"type": "simple", "action": "status"}
+
+    return {"type": "complex", "description": text}

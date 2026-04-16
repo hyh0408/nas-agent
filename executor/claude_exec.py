@@ -15,6 +15,9 @@ async def run_claude(prompt: str, work_dir: str | None = None) -> str:
     # 작업 디렉터리가 없으면 생성
     os.makedirs(cwd, exist_ok=True)
 
+    # ANTHROPIC_API_KEY 가 있으면 CLI 가 구독 세션 대신 API 로 결제되므로 제거
+    env = {k: v for k, v in os.environ.items() if k != "ANTHROPIC_API_KEY"}
+
     proc = await asyncio.create_subprocess_exec(
         Config.CLAUDE_CLI_PATH,
         "-p", prompt,
@@ -22,7 +25,7 @@ async def run_claude(prompt: str, work_dir: str | None = None) -> str:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
-        env={**os.environ},
+        env=env,
     )
 
     try:
