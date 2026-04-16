@@ -360,6 +360,65 @@ async def test_github_init_failure_still_runs_workflow(registry, projects_dir):
     # repo_url 이 설정되지 않았으므로 github_sync 도 스킵됨 (assert 안 걸림)
 
 
+async def test_new_project_prompt_requires_claude_md(registry, projects_dir):
+    graph = wf.build_workflow(registry)
+
+    project_name = "myapp"
+    project_dir = os.path.join(projects_dir, project_name)
+    os.makedirs(project_dir, exist_ok=True)
+    with open(os.path.join(project_dir, "docker-compose.yml"), "w") as f:
+        f.write("services: {}")
+
+    captured = {}
+
+    async def fake_claude(prompt, **kwargs):
+        captured["p"] = prompt
+        return ClaudeResult(session_id="s", text="ok", is_error=False, raw={})
+
+    with patch.object(wf, "run_claude", side_effect=fake_claude), _patch_docker():
+        await graph.ainvoke({
+            "project_name": project_name,
+            "task": "",
+            "is_new": True,
+            "description": "할일 API",
+            "projects_dir": projects_dir,
+        })
+
+    p = captured["p"]
+    assert "CLAUDE.md" in p
+    assert "원본 요구사항" in p
+    assert "변경 이력" in p
+
+
+async def test_continue_project_prompt_updates_claude_md(registry, projects_dir):
+    graph = wf.build_workflow(registry)
+    await registry.create("myapp", "x")
+    project_dir = os.path.join(projects_dir, "myapp")
+    os.makedirs(project_dir, exist_ok=True)
+    with open(os.path.join(project_dir, "docker-compose.yml"), "w") as f:
+        f.write("services: {}")
+
+    captured = {}
+
+    async def fake_claude(prompt, **kwargs):
+        captured["p"] = prompt
+        return ClaudeResult(session_id="s", text="ok", is_error=False, raw={})
+
+    with patch.object(wf, "run_claude", side_effect=fake_claude), _patch_docker():
+        await graph.ainvoke({
+            "project_name": "myapp",
+            "task": "로그인 추가",
+            "is_new": False,
+            "description": "",
+            "projects_dir": projects_dir,
+        })
+
+    p = captured["p"]
+    assert "CLAUDE.md" in p
+    assert "업데이트" in p
+    assert "변경 이력" in p
+
+
 async def test_new_project_with_db_provisions_and_feeds_prompt(registry, projects_dir):
     my_cfg = wf.MySQLConfig(root_password="rootpw", host="nas-mysql")
     graph = wf.build_workflow(registry, wf.GitHubConfig(), my_cfg)

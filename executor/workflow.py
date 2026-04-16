@@ -77,6 +77,27 @@ class WorkflowState(TypedDict, total=False):
     status: str
 
 
+CLAUDE_MD_RULES_NEW = (
+    "- 프로젝트 루트에 CLAUDE.md 를 **반드시** 생성. 다음 섹션을 한국어로 작성:\n"
+    "    1. 프로젝트 개요 — 목적, 해결하는 문제, 주요 사용자\n"
+    "    2. 원본 요구사항 — 사용자의 최초 설명을 그대로 인용\n"
+    "    3. 기술 스택 — 언어/프레임워크/런타임\n"
+    "    4. 파일 구조 — 주요 디렉터리·파일 한 줄 설명\n"
+    "    5. 실행·배포 — 로컬/NAS docker compose 명령\n"
+    "    6. 환경변수 — 이름·용도·필수 여부\n"
+    "    7. 데이터 모델 — (DB 가 있으면) 테이블·주요 필드\n"
+    "    8. 변경 이력 — [YYYY-MM-DD] 형식으로 이번 스캐폴딩 항목\n"
+)
+
+CLAUDE_MD_RULES_CONTINUE = (
+    "- 프로젝트 루트의 CLAUDE.md 가 있으면 **반드시 업데이트**. 없으면 새로 생성.\n"
+    "    - 원본 요구사항 섹션은 유지, 이번 변경으로 확장된 기능이 있으면 기술 스택·\n"
+    "      파일 구조·데이터 모델 섹션에 반영\n"
+    "    - 변경 이력 맨 위에 `[오늘 날짜] <이번 요청>` 한 줄 추가\n"
+    "    - 기존 내용과 모순되는 부분은 최신화하되, 역사적 맥락은 가능한 보존\n"
+)
+
+
 NEW_PROJECT_PROMPT = (
     "새 프로젝트 '{name}' 를 현재 디렉터리에 스캐폴딩합니다.\n"
     "설명: {description}\n"
@@ -88,6 +109,7 @@ NEW_PROJECT_PROMPT = (
     "- 포트 충돌이 없도록 합리적인 호스트 포트 선택\n"
     "- 작업이 끝나면 자동으로 docker compose 로 배포되므로 즉시 실행 가능한 상태여야 함\n"
     "- git 작업(add/commit/push) 은 자동 처리되므로 직접 실행하지 마세요\n"
+    "{claude_md_rules}"
     "- 마지막에 한국어로 변경 내역을 3~5줄로 요약"
 )
 
@@ -101,6 +123,7 @@ CONTINUE_PROJECT_PROMPT = (
     "- Dockerfile / docker-compose.yml 이 이미 있으면 그대로 사용하고 필요 시에만 수정\n"
     "- 작업이 끝나면 자동으로 재배포되므로 즉시 실행 가능한 상태여야 함\n"
     "- git 작업(add/commit/push) 은 자동 처리되므로 직접 실행하지 마세요\n"
+    "{claude_md_rules}"
     "- 마지막에 한국어로 변경 내역을 3~5줄로 요약"
 )
 
@@ -234,11 +257,15 @@ def build_workflow(
                 name=project.name,
                 description=state.get("description", ""),
                 db_section=db_section,
+                claude_md_rules=CLAUDE_MD_RULES_NEW,
             )
             resume = False
         else:
             prompt = CONTINUE_PROJECT_PROMPT.format(
-                name=project.name, task=state["task"], db_section=db_section
+                name=project.name,
+                task=state["task"],
+                db_section=db_section,
+                claude_md_rules=CLAUDE_MD_RULES_CONTINUE,
             )
             resume = True
 
