@@ -25,6 +25,13 @@ class Config:
     GIT_USER_NAME: str = os.environ.get("GIT_USER_NAME", "NAS Agent")
     GIT_USER_EMAIL: str = os.environ.get("GIT_USER_EMAIL", "nas-agent@local")
 
+    # MySQL 연동 (선택). MYSQL_ROOT_PASSWORD 비면 --db 요청이 거절됨.
+    MYSQL_ROOT_PASSWORD: str = os.environ.get("MYSQL_ROOT_PASSWORD", "")
+    MYSQL_CONTAINER: str = os.environ.get("MYSQL_CONTAINER", "nas-mysql")
+    MYSQL_HOST: str = os.environ.get("MYSQL_HOST", "nas-mysql")
+    MYSQL_PORT: int = int(os.environ.get("MYSQL_PORT", "3306"))
+    SHARED_NETWORK: str = os.environ.get("SHARED_NETWORK", "nas-agent-shared")
+
     @classmethod
     def registry_db_path(cls) -> str:
         return os.path.join(cls.DATA_DIR, "registry.db")

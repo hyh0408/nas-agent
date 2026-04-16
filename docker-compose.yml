@@ -5,7 +5,8 @@ services:
     build: .
     container_name: nas-agent
     restart: unless-stopped
-    network_mode: bridge
+    networks:
+      - nas-agent-shared
     env_file:
       - .env
     volumes:
@@ -24,3 +25,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+
+networks:
+  nas-agent-shared:
+    external: true

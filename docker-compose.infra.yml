@@ -1,0 +1,36 @@
+version: "3.8"
+
+# NAS Agent 가 관리하는 프로젝트들이 공유하는 인프라.
+#
+# 한 번만 띄우면 됩니다:
+#   docker network create nas-agent-shared   # 최초 1회
+#   docker compose -f docker-compose.infra.yml up -d
+#
+# 이후 nas-agent / 각 프로젝트 컨테이너는 nas-agent-shared 외부 네트워크에
+# 붙어서 nas-mysql 과 통신합니다.
+
+services:
+  nas-mysql:
+    image: mysql:8
+    container_name: nas-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD 환경변수 필요}
+      TZ: Asia/Seoul
+    command:
+      - --default-authentication-plugin=caching_sha2_password
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    volumes:
+      - /volume1/docker/nas-mysql/data:/var/lib/mysql
+    networks:
+      - nas-agent-shared
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+networks:
+  nas-agent-shared:
+    external: true

@@ -9,9 +9,10 @@ from unittest.mock import patch
 import pytest
 
 from executor import workflow as wf
-from executor import github_exec
+from executor import github_exec, mysql_exec
 from executor.claude_exec import ClaudeResult
 from executor.github_exec import GitResult, RepoInfo
+from executor.mysql_exec import DBCredentials, MySQLError
 from executor.projects import ProjectRegistry
 
 
@@ -357,6 +358,113 @@ async def test_github_init_failure_still_runs_workflow(registry, projects_dir):
     assert state["deployed"] is True
     assert "API rate limit" in state["github_output"]
     # repo_url 이 설정되지 않았으므로 github_sync 도 스킵됨 (assert 안 걸림)
+
+
+async def test_new_project_with_db_provisions_and_feeds_prompt(registry, projects_dir):
+    my_cfg = wf.MySQLConfig(root_password="rootpw", host="nas-mysql")
+    graph = wf.build_workflow(registry, wf.GitHubConfig(), my_cfg)
+
+    project_name = "myapp"
+    project_dir = os.path.join(projects_dir, project_name)
+    os.makedirs(project_dir, exist_ok=True)
+    with open(os.path.join(project_dir, "docker-compose.yml"), "w") as f:
+        f.write("services: {}")
+
+    creds = DBCredentials(
+        host="nas-mysql", port=3306,
+        database="proj_myapp", user="proj_myapp", password="secret123",
+    )
+
+    captured_prompt = {}
+
+    async def fake_provision(name, **kwargs):
+        return creds
+
+    async def fake_claude(prompt, **kwargs):
+        captured_prompt["p"] = prompt
+        return ClaudeResult(session_id="s", text="ok", is_error=False, raw={})
+
+    with patch.object(mysql_exec, "provision", side_effect=fake_provision), \
+         patch.object(wf, "run_claude", side_effect=fake_claude), \
+         _patch_docker():
+        state = await graph.ainvoke({
+            "project_name": project_name,
+            "task": "",
+            "is_new": True,
+            "description": "블로그",
+            "db_required": True,
+            "projects_dir": projects_dir,
+        })
+
+    # 프롬프트에 DB 정보가 실렸다
+    p = captured_prompt["p"]
+    assert "proj_myapp" in p
+    assert "secret123" in p
+    assert "nas-agent-shared" in p
+
+    # 레지스트리에도 저장
+    persisted = await registry.get(project_name)
+    assert persisted.db_name == "proj_myapp"
+    assert persisted.db_user == "proj_myapp"
+    assert persisted.db_password == "secret123"
+    assert state["db_credentials"].database == "proj_myapp"
+
+
+async def test_db_required_without_mysql_config_errors(registry, projects_dir):
+    graph = wf.build_workflow(registry, wf.GitHubConfig(), wf.MySQLConfig(root_password=""))
+
+    async def must_not_call(*a, **k):
+        raise AssertionError("CLI 호출되면 안 됨")
+
+    with patch.object(wf, "run_claude", side_effect=must_not_call):
+        state = await graph.ainvoke({
+            "project_name": "myapp",
+            "task": "",
+            "is_new": True,
+            "description": "x",
+            "db_required": True,
+            "projects_dir": projects_dir,
+        })
+
+    assert "MySQL" in state.get("error", "")
+
+
+async def test_continue_project_reloads_existing_db_credentials(registry, projects_dir):
+    my_cfg = wf.MySQLConfig(root_password="pw", host="nas-mysql")
+    graph = wf.build_workflow(registry, wf.GitHubConfig(), my_cfg)
+
+    p = await registry.create("myapp", "x")
+    await registry.set_db_info("myapp", "proj_myapp", "proj_myapp", "stored-pw")
+
+    project_dir = os.path.join(projects_dir, "myapp")
+    os.makedirs(project_dir, exist_ok=True)
+    with open(os.path.join(project_dir, "docker-compose.yml"), "w") as f:
+        f.write("services: {}")
+
+    captured = {}
+
+    async def fake_claude(prompt, **kwargs):
+        captured["p"] = prompt
+        return ClaudeResult(session_id="s", text="ok", is_error=False, raw={})
+
+    async def must_not_provision(*a, **k):
+        raise AssertionError("계속 작업에서는 신규 프로비저닝 안 됨")
+
+    with patch.object(mysql_exec, "provision", side_effect=must_not_provision), \
+         patch.object(wf, "run_claude", side_effect=fake_claude), \
+         _patch_docker():
+        state = await graph.ainvoke({
+            "project_name": "myapp",
+            "task": "추가 기능",
+            "is_new": False,
+            "description": "",
+            "db_required": False,  # continue 에서는 기존 DB 가 있으면 자동으로 실림
+            "projects_dir": projects_dir,
+        })
+
+    assert "proj_myapp" in captured["p"]
+    assert "stored-pw" in captured["p"]
+    assert state["db_credentials"].password == "stored-pw"
 
 
 async def test_github_sync_skipped_when_cli_errors(registry, projects_dir):

@@ -31,6 +31,9 @@ class Project:
     created_at: str
     updated_at: str
     repo_url: Optional[str] = None
+    db_name: Optional[str] = None
+    db_user: Optional[str] = None
+    db_password: Optional[str] = None
 
 
 @dataclass
@@ -92,10 +95,11 @@ class ProjectRegistry:
                 CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_name);
                 """
             )
-            # 마이그레이션: repo_url 컬럼이 없으면 추가
+            # 마이그레이션: 새 컬럼들
             cols = {row[1] for row in conn.execute("PRAGMA table_info(projects)")}
-            if "repo_url" not in cols:
-                conn.execute("ALTER TABLE projects ADD COLUMN repo_url TEXT")
+            for col in ("repo_url", "db_name", "db_user", "db_password"):
+                if col not in cols:
+                    conn.execute(f"ALTER TABLE projects ADD COLUMN {col} TEXT")
 
     # ── 동기 구현 ─────────────────────────────────────────────
 
@@ -115,7 +119,8 @@ class ProjectRegistry:
         return Project(name, description, session_id, now, now)
 
     _SELECT = (
-        "SELECT name, description, session_id, created_at, updated_at, repo_url "
+        "SELECT name, description, session_id, created_at, updated_at, "
+        "repo_url, db_name, db_user, db_password "
         "FROM projects"
     )
 
@@ -183,6 +188,16 @@ class ProjectRegistry:
                 (repo_url, _utcnow(), name),
             )
 
+    def _set_db_info_sync(
+        self, name: str, db_name: str, db_user: str, db_password: str
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE projects SET db_name = ?, db_user = ?, db_password = ?, "
+                "updated_at = ? WHERE name = ?",
+                (db_name, db_user, db_password, _utcnow(), name),
+            )
+
     # ── async 래퍼 ────────────────────────────────────────────
 
     async def create(self, name: str, description: str) -> Project:
@@ -210,3 +225,10 @@ class ProjectRegistry:
 
     async def set_repo_url(self, name: str, repo_url: str) -> None:
         await asyncio.to_thread(self._set_repo_url_sync, name, repo_url)
+
+    async def set_db_info(
+        self, name: str, db_name: str, db_user: str, db_password: str
+    ) -> None:
+        await asyncio.to_thread(
+            self._set_db_info_sync, name, db_name, db_user, db_password
+        )

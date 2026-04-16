@@ -54,6 +54,12 @@ NEW_PROJECT = re.compile(
     re.IGNORECASE,
 )
 
+# DB 필요 키워드. 설명에 포함되면 db_required=True
+DB_KEYWORD = re.compile(
+    r"(\bdb\b|\bmysql\b|\bdatabase\b|데이터\s*베이스|디비)",
+    re.IGNORECASE,
+)
+
 TARGET_TOKEN = re.compile(r"[a-zA-Z][a-zA-Z0-9_-]+")
 
 
@@ -88,6 +94,7 @@ def classify(message: str, known_projects: Iterable[str] = ()) -> dict:
             "mode": "new",
             "name": name,
             "description": description,
+            "db_required": bool(DB_KEYWORD.search(description) or DB_KEYWORD.search(text)),
         }
 
     # 기존 프로젝트 이어서 작업: 메시지 어딘가에 등록된 프로젝트 이름이 있고,

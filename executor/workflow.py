@@ -19,9 +19,10 @@ from typing import Optional, TypedDict
 
 from langgraph.graph import StateGraph, START, END
 
-from executor import github_exec
+from executor import github_exec, mysql_exec
 from executor.claude_exec import run_claude, ClaudeResult
 from executor.github_exec import GitHubError, RepoInfo
+from executor.mysql_exec import DBCredentials, MySQLError
 from executor.projects import Project, ProjectError, ProjectRegistry
 
 
@@ -41,6 +42,19 @@ class GitHubConfig:
         return github_exec.is_enabled(self.token)
 
 
+@dataclass
+class MySQLConfig:
+    root_password: str = ""
+    container: str = "nas-mysql"
+    host: str = "nas-mysql"
+    port: int = 3306
+    shared_network: str = "nas-agent-shared"
+
+    @property
+    def enabled(self) -> bool:
+        return mysql_exec.is_enabled(self.root_password)
+
+
 class WorkflowState(TypedDict, total=False):
     # 입력
     project_name: str
@@ -48,6 +62,7 @@ class WorkflowState(TypedDict, total=False):
     is_new: bool
     description: str
     projects_dir: str
+    db_required: bool  # /new --db 또는 자연어 DB 키워드
 
     # 중간 / 출력
     project: Optional[Project]
@@ -56,14 +71,17 @@ class WorkflowState(TypedDict, total=False):
     deployed: bool
     github_output: str
     github_pushed: bool
+    db_credentials: Optional[DBCredentials]
+    db_output: str
     error: Optional[str]
     status: str
 
 
 NEW_PROJECT_PROMPT = (
     "새 프로젝트 '{name}' 를 현재 디렉터리에 스캐폴딩합니다.\n"
-    "설명: {description}\n\n"
-    "작업 규칙:\n"
+    "설명: {description}\n"
+    "{db_section}"
+    "\n작업 규칙:\n"
     "- 모든 파일을 현재 디렉터리 안에 배치\n"
     "- Dockerfile 과 docker-compose.yml 반드시 포함\n"
     "- docker-compose.yml 의 container_name 은 '{name}'\n"
@@ -76,8 +94,9 @@ NEW_PROJECT_PROMPT = (
 CONTINUE_PROJECT_PROMPT = (
     "프로젝트 '{name}' 를 이어서 개발합니다.\n"
     "현재 디렉터리가 프로젝트 루트이며 이전 작업 세션이 복원되어 있습니다.\n\n"
-    "요청: {task}\n\n"
-    "작업 규칙:\n"
+    "요청: {task}\n"
+    "{db_section}"
+    "\n작업 규칙:\n"
     "- 기존 파일 구조/스타일 유지\n"
     "- Dockerfile / docker-compose.yml 이 이미 있으면 그대로 사용하고 필요 시에만 수정\n"
     "- 작업이 끝나면 자동으로 재배포되므로 즉시 실행 가능한 상태여야 함\n"
@@ -86,14 +105,35 @@ CONTINUE_PROJECT_PROMPT = (
 )
 
 
+def _db_prompt_section(creds: Optional[DBCredentials], shared_network: str) -> str:
+    if creds is None:
+        return ""
+    return (
+        "\n사용 가능한 MySQL 데이터베이스 (공유 nas-mysql 컨테이너):\n"
+        f"  HOST: {creds.host}\n"
+        f"  PORT: {creds.port}\n"
+        f"  DATABASE: {creds.database}\n"
+        f"  USER: {creds.user}\n"
+        f"  PASSWORD: {creds.password}\n\n"
+        f"docker-compose.yml 추가 규칙:\n"
+        f"- 최상위에 networks 섹션 정의: `{shared_network}: {{ external: true }}`\n"
+        f"- 앱 서비스에 networks: [{shared_network}] 연결\n"
+        f"- 앱 서비스 environment 에 MYSQL_HOST / MYSQL_PORT / MYSQL_DATABASE /\n"
+        f"  MYSQL_USER / MYSQL_PASSWORD 를 위 값 그대로 주입\n"
+        f"- MySQL 서비스를 프로젝트에 따로 띄우지 말 것 (공유 DB 재사용)\n"
+    )
+
+
 def build_workflow(
     registry: ProjectRegistry,
     github: Optional[GitHubConfig] = None,
+    mysql: Optional[MySQLConfig] = None,
     *,
     deploy_timeout: int = 600,
 ):
-    """레지스트리·GitHub 설정을 클로저로 바인딩한 컴파일된 그래프를 돌려준다."""
+    """레지스트리·GitHub·MySQL 설정을 클로저로 바인딩한 컴파일된 그래프를 돌려준다."""
     gh_cfg = github or GitHubConfig()
+    my_cfg = mysql or MySQLConfig()
 
     async def load(state: WorkflowState) -> dict:
         name = state["project_name"]
@@ -135,19 +175,70 @@ def build_workflow(
         refreshed = await registry.get(project.name)
         return {"project": refreshed, "github_output": f"GitHub repo: {repo.html_url}"}
 
+    async def provision_db(state: WorkflowState) -> dict:
+        """새 프로젝트면서 db_required 면 MySQL 에 database+user 를 만든다.
+        기존 프로젝트면 레지스트리에 저장된 자격증명을 state 에 올린다."""
+        project: Optional[Project] = state.get("project")
+        if project is None:
+            return {}
+
+        if state["is_new"]:
+            if not state.get("db_required"):
+                return {}
+            if not my_cfg.enabled:
+                return {
+                    "error": "MySQL 이 설정되지 않았습니다 (MYSQL_ROOT_PASSWORD 필요)",
+                    "status": "error",
+                }
+            try:
+                creds = await mysql_exec.provision(
+                    project.name,
+                    root_password=my_cfg.root_password,
+                    container=my_cfg.container,
+                    host=my_cfg.host,
+                    port=my_cfg.port,
+                )
+            except MySQLError as e:
+                return {"error": f"DB 프로비저닝 실패: {e}", "status": "error"}
+
+            await registry.set_db_info(
+                project.name, creds.database, creds.user, creds.password
+            )
+            refreshed = await registry.get(project.name)
+            return {
+                "project": refreshed,
+                "db_credentials": creds,
+                "db_output": f"DB 생성: {creds.database} / user {creds.user}",
+            }
+
+        # 계속 작업: 이미 저장된 DB 가 있으면 state 에 실어준다
+        if project.db_name and project.db_user and project.db_password:
+            creds = DBCredentials(
+                host=my_cfg.host,
+                port=my_cfg.port,
+                database=project.db_name,
+                user=project.db_user,
+                password=project.db_password,
+            )
+            return {"db_credentials": creds}
+        return {}
+
     async def claude(state: WorkflowState) -> dict:
         project: Project = state["project"]
         project_dir = os.path.join(state["projects_dir"], project.name)
         os.makedirs(project_dir, exist_ok=True)
 
+        db_section = _db_prompt_section(state.get("db_credentials"), my_cfg.shared_network)
         if state["is_new"]:
             prompt = NEW_PROJECT_PROMPT.format(
-                name=project.name, description=state.get("description", "")
+                name=project.name,
+                description=state.get("description", ""),
+                db_section=db_section,
             )
             resume = False
         else:
             prompt = CONTINUE_PROJECT_PROMPT.format(
-                name=project.name, task=state["task"]
+                name=project.name, task=state["task"], db_section=db_section
             )
             resume = True
 
@@ -262,9 +353,14 @@ def build_workflow(
     def route_after_load(state: WorkflowState) -> str:
         return END if state.get("error") else "github_init"
 
+    def route_after_db(state: WorkflowState) -> str:
+        # DB 프로비저닝 실패는 치명적 — 바로 persist 로 가서 기록 후 종료
+        return "persist" if state.get("error") else "claude"
+
     g = StateGraph(WorkflowState)
     g.add_node("load", load)
     g.add_node("github_init", github_init)
+    g.add_node("provision_db", provision_db)
     g.add_node("claude", claude)
     g.add_node("deploy", deploy)
     g.add_node("github_sync", github_sync)
@@ -274,7 +370,10 @@ def build_workflow(
     g.add_conditional_edges(
         "load", route_after_load, {"github_init": "github_init", END: END}
     )
-    g.add_edge("github_init", "claude")
+    g.add_edge("github_init", "provision_db")
+    g.add_conditional_edges(
+        "provision_db", route_after_db, {"claude": "claude", "persist": "persist"}
+    )
     g.add_edge("claude", "deploy")
     g.add_edge("deploy", "github_sync")
     g.add_edge("github_sync", "persist")
@@ -312,6 +411,10 @@ def format_workflow_result(state: WorkflowState) -> str:
     if gh_output:
         icon = "✅" if state.get("github_pushed") else "ℹ️"
         parts.append(f"{icon} GitHub: {gh_output}")
+
+    db_output = state.get("db_output")
+    if db_output:
+        parts.append(f"🗄 {db_output}")
 
     text = "\n\n".join(p for p in parts if p)
     return _truncate(text, 3500)

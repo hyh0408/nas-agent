@@ -68,6 +68,21 @@ def test_new_project_patterns(text, name):
     assert result["description"]
 
 
+@pytest.mark.parametrize(
+    "text,should_require_db",
+    [
+        ("myapp 만들어줘: FastAPI 블로그", False),
+        ("myapp 만들어줘: FastAPI 블로그 DB 필요", True),
+        ("myapp 만들어줘: MySQL 로 할일 저장", True),
+        ("myapp 만들어줘: 데이터베이스 필요한 블로그", True),
+    ],
+)
+def test_new_project_detects_db_requirement(text, should_require_db):
+    result = classify(text)
+    assert result["type"] == "project"
+    assert result["db_required"] is should_require_db
+
+
 def test_continue_project_when_name_is_known():
     result = classify("myapp 에 로그인 기능 추가해줘", known_projects={"myapp"})
     assert result["type"] == "project"

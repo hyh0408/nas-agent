@@ -25,8 +25,15 @@ from executor.docker_exec import (
     list_projects as list_project_dirs,
     system_status,
 )
+from executor import mysql_exec
+from executor.mysql_exec import MySQLError
 from executor.projects import ProjectRegistry, ProjectError, validate_name
-from executor.workflow import build_workflow, format_workflow_result, GitHubConfig
+from executor.workflow import (
+    build_workflow,
+    format_workflow_result,
+    GitHubConfig,
+    MySQLConfig,
+)
 
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -54,11 +61,18 @@ def _init_state() -> None:
         user_name=Config.GIT_USER_NAME,
         user_email=Config.GIT_USER_EMAIL,
     )
-    workflow = build_workflow(registry, github_cfg)
-    if github_cfg.enabled:
-        logger.info(f"GitHub 연동 활성: owner={github_cfg.owner or '<token owner>'}")
-    else:
-        logger.info("GitHub 연동 비활성 (GITHUB_TOKEN 미설정)")
+    mysql_cfg = MySQLConfig(
+        root_password=Config.MYSQL_ROOT_PASSWORD,
+        container=Config.MYSQL_CONTAINER,
+        host=Config.MYSQL_HOST,
+        port=Config.MYSQL_PORT,
+        shared_network=Config.SHARED_NETWORK,
+    )
+    workflow = build_workflow(registry, github_cfg, mysql_cfg)
+    logger.info(
+        f"GitHub: {'ON' if github_cfg.enabled else 'OFF'} | "
+        f"MySQL: {'ON' if mysql_cfg.enabled else 'OFF'}"
+    )
 
 
 # ── 보안 ────────────────────────────────────────────────────
@@ -77,7 +91,13 @@ def authorized(func):
 # ── 공통 유틸 ────────────────────────────────────────────────
 
 async def _run_workflow_and_reply(
-    update: Update, *, project_name: str, is_new: bool, task: str = "", description: str = ""
+    update: Update,
+    *,
+    project_name: str,
+    is_new: bool,
+    task: str = "",
+    description: str = "",
+    db_required: bool = False,
 ):
     lock = _project_locks[project_name]
     if lock.locked():
@@ -88,8 +108,9 @@ async def _run_workflow_and_reply(
 
     async with lock:
         action_label = "생성" if is_new else "작업"
+        extras = " (+MySQL DB)" if is_new and db_required else ""
         await update.message.reply_text(
-            f"🔨 '{project_name}' {action_label} 시작. 완료까지 몇 분 걸릴 수 있습니다."
+            f"🔨 '{project_name}' {action_label}{extras} 시작. 완료까지 몇 분 걸릴 수 있습니다."
         )
         try:
             state = await workflow.ainvoke({
@@ -97,6 +118,7 @@ async def _run_workflow_and_reply(
                 "task": task,
                 "is_new": is_new,
                 "description": description,
+                "db_required": db_required,
                 "projects_dir": Config.PROJECTS_DIR,
             })
         except Exception as e:
@@ -114,11 +136,11 @@ async def cmd_start(update: Update, context):
     await update.message.reply_text(
         "NAS Agent Bot\n\n"
         "── 프로젝트 ─────────────\n"
-        "/new <이름> <설명>       - 새 프로젝트 생성 + 자동 배포\n"
-        "/work <이름> <작업>      - 기존 프로젝트 이어서 개발 + 재배포\n"
-        "/info <이름>             - 프로젝트 상태·히스토리\n"
-        "/projects                - 프로젝트 목록\n"
-        "/rm <이름>               - 프로젝트 레지스트리에서 제거\n\n"
+        "/new <이름> [--db] <설명>  - 새 프로젝트 생성 + 자동 배포 (--db: MySQL DB 함께)\n"
+        "/work <이름> <작업>       - 기존 프로젝트 이어서 개발 + 재배포\n"
+        "/info <이름>              - 프로젝트 상태·히스토리\n"
+        "/projects                 - 프로젝트 목록\n"
+        "/rm <이름> [--drop-db]    - 레지스트리 제거 (--drop-db: DB 도 삭제)\n\n"
         "── 컨테이너 ─────────────\n"
         "/sys                    - NAS 리소스 상태\n"
         "/status                 - 컨테이너 상태\n"
@@ -171,17 +193,32 @@ async def cmd_restart(update: Update, context):
 @authorized
 async def cmd_new(update: Update, context):
     if len(context.args) < 2:
-        await update.message.reply_text("사용법: /new <이름> <설명>")
+        await update.message.reply_text(
+            "사용법: /new <이름> [--db] <설명>\n"
+            "  --db 지정 시 MySQL database 를 자동 생성해 프로젝트에 연결"
+        )
         return
     name = context.args[0].lower()
-    description = " ".join(context.args[1:])
+    rest = list(context.args[1:])
+    db_required = False
+    if rest and rest[0] == "--db":
+        db_required = True
+        rest = rest[1:]
+    if not rest:
+        await update.message.reply_text("설명이 비어 있습니다.")
+        return
+    description = " ".join(rest)
     try:
         validate_name(name)
     except ProjectError as e:
         await update.message.reply_text(str(e))
         return
     await _run_workflow_and_reply(
-        update, project_name=name, is_new=True, description=description
+        update,
+        project_name=name,
+        is_new=True,
+        description=description,
+        db_required=db_required,
     )
 
 
@@ -215,6 +252,8 @@ async def cmd_info(update: Update, context):
     ]
     if project.repo_url:
         lines.append(f"repo: {project.repo_url}")
+    if project.db_name:
+        lines.append(f"DB: {project.db_name} (user {project.db_user})")
     lines.extend(["", "최근 작업:"])
     if not history:
         lines.append("(아직 없음)")
@@ -240,12 +279,32 @@ async def cmd_projects(update: Update, context):
 @authorized
 async def cmd_rm(update: Update, context):
     if not context.args:
-        await update.message.reply_text("사용법: /rm <프로젝트이름>")
+        await update.message.reply_text("사용법: /rm <프로젝트이름> [--drop-db]")
         return
     name = context.args[0].lower()
-    removed = await registry.delete(name)
-    msg = f"'{name}' 제거됨" if removed else f"없는 프로젝트: {name}"
-    await update.message.reply_text(msg + "\n(프로젝트 파일은 그대로 남아 있습니다)")
+    drop_db = "--drop-db" in context.args[1:]
+
+    project = await registry.get(name)
+    if not project:
+        await update.message.reply_text(f"없는 프로젝트: {name}")
+        return
+
+    db_msg = ""
+    if drop_db and project.db_name and Config.MYSQL_ROOT_PASSWORD:
+        try:
+            await mysql_exec.drop(
+                name,
+                root_password=Config.MYSQL_ROOT_PASSWORD,
+                container=Config.MYSQL_CONTAINER,
+            )
+            db_msg = f"\nMySQL DB '{project.db_name}' 삭제됨"
+        except MySQLError as e:
+            db_msg = f"\nMySQL 삭제 실패: {e}"
+
+    await registry.delete(name)
+    await update.message.reply_text(
+        f"'{name}' 제거됨\n(프로젝트 파일은 그대로 남아 있습니다)" + db_msg
+    )
 
 
 # ── 자연어 메시지 핸들러 ─────────────────────────────────────
@@ -273,6 +332,7 @@ async def handle_message(update: Update, context):
                 project_name=classified["name"],
                 is_new=True,
                 description=classified["description"],
+                db_required=bool(classified.get("db_required")),
             )
         else:
             await _run_workflow_and_reply(
