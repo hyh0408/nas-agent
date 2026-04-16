@@ -1,7 +1,8 @@
-"""claude_exec 가 서브프로세스 env 에서 ANTHROPIC_API_KEY 를 제거하는지 검증."""
+"""claude_exec 래퍼 테스트 — 실제 CLI 를 호출하지 않고 서브프로세스를 mock 한다."""
 
 import asyncio
-from unittest.mock import patch, MagicMock
+import json
+from unittest.mock import patch
 
 import pytest
 
@@ -9,68 +10,99 @@ from executor import claude_exec
 
 
 class _FakeProc:
-    def __init__(self):
-        self.returncode = 0
+    def __init__(self, stdout: bytes = b"", stderr: bytes = b"", rc: int = 0):
+        self._stdout = stdout
+        self._stderr = stderr
+        self.returncode = rc
 
     async def communicate(self):
-        return (b"ok", b"")
+        return (self._stdout, self._stderr)
 
     def kill(self):
         pass
 
 
-async def test_api_key_stripped_from_subprocess_env(monkeypatch, tmp_path):
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-be-removed")
-    monkeypatch.setenv("OTHER_VAR", "keep-me")
+def _ok_payload(session_id="sess-123", result="done"):
+    return json.dumps({
+        "session_id": session_id,
+        "result": result,
+        "is_error": False,
+    }).encode()
 
+
+async def test_new_session_uses_session_id_flag(monkeypatch, tmp_path):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     captured = {}
 
     async def fake_exec(*args, **kwargs):
         captured["args"] = args
         captured["env"] = kwargs.get("env")
-        return _FakeProc()
+        return _FakeProc(stdout=_ok_payload(session_id="new-sess"))
 
     with patch.object(claude_exec.asyncio, "create_subprocess_exec", side_effect=fake_exec):
-        await claude_exec.run_claude("hello", work_dir=str(tmp_path))
+        result = await claude_exec.run_claude(
+            "hello", cwd=str(tmp_path), session_id="new-sess", resume=False
+        )
 
-    env = captured["env"]
-    assert env is not None
-    assert "ANTHROPIC_API_KEY" not in env
-    assert env.get("OTHER_VAR") == "keep-me"
+    args = captured["args"]
+    assert "--session-id" in args
+    assert args[args.index("--session-id") + 1] == "new-sess"
+    assert "--resume" not in args
+    assert "--permission-mode" in args
+    assert result.session_id == "new-sess"
+    assert result.text == "done"
+    assert result.is_error is False
 
 
-async def test_cli_invoked_with_print_flag(monkeypatch, tmp_path):
+async def test_resume_uses_resume_flag(monkeypatch, tmp_path):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     captured = {}
 
     async def fake_exec(*args, **kwargs):
         captured["args"] = args
-        return _FakeProc()
+        return _FakeProc(stdout=_ok_payload(session_id="old-sess", result="continued"))
 
     with patch.object(claude_exec.asyncio, "create_subprocess_exec", side_effect=fake_exec):
-        await claude_exec.run_claude("build me an app", work_dir=str(tmp_path))
+        result = await claude_exec.run_claude(
+            "continue", cwd=str(tmp_path), session_id="old-sess", resume=True
+        )
 
     args = captured["args"]
-    assert "-p" in args
-    assert "build me an app" in args
-    assert "--output-format" in args
-    assert "text" in args
+    assert "--resume" in args
+    assert args[args.index("--resume") + 1] == "old-sess"
+    assert "--session-id" not in args
+    assert result.text == "continued"
 
 
-async def test_timeout_returns_korean_message(monkeypatch, tmp_path):
+async def test_api_key_stripped_from_subprocess_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-leak")
+    monkeypatch.setenv("KEEP_ME", "yes")
+    captured = {}
+
+    async def fake_exec(*args, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return _FakeProc(stdout=_ok_payload())
+
+    with patch.object(claude_exec.asyncio, "create_subprocess_exec", side_effect=fake_exec):
+        await claude_exec.run_claude("x", cwd=str(tmp_path))
+
+    env = captured["env"]
+    assert "ANTHROPIC_API_KEY" not in env
+    assert env["KEEP_ME"] == "yes"
+
+
+async def test_timeout_returns_error_result(monkeypatch, tmp_path):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
-    class _HangingProc:
+    class _Hanging:
         returncode = None
-
         def communicate(self):
-            return asyncio.get_event_loop().create_future()  # never resolves
-
+            return asyncio.get_event_loop().create_future()
         def kill(self):
             pass
 
     async def fake_exec(*args, **kwargs):
-        return _HangingProc()
+        return _Hanging()
 
     async def fake_wait_for(coro, timeout):
         if hasattr(coro, "cancel"):
@@ -79,28 +111,36 @@ async def test_timeout_returns_korean_message(monkeypatch, tmp_path):
 
     with patch.object(claude_exec.asyncio, "create_subprocess_exec", side_effect=fake_exec):
         with patch.object(claude_exec.asyncio, "wait_for", side_effect=fake_wait_for):
-            result = await claude_exec.run_claude("hi", work_dir=str(tmp_path))
+            result = await claude_exec.run_claude(
+                "hi", cwd=str(tmp_path), session_id="s", timeout=1
+            )
 
-    assert "시간 초과" in result
+    assert result.is_error
+    assert "시간 초과" in result.text
 
 
-async def test_nonzero_returncode_surfaces_stderr(monkeypatch, tmp_path):
+async def test_nonzero_exit_without_json_is_error(monkeypatch, tmp_path):
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
-    class _FailingProc:
-        returncode = 1
-
-        async def communicate(self):
-            return (b"partial output", b"boom")
-
-        def kill(self):
-            pass
-
     async def fake_exec(*args, **kwargs):
-        return _FailingProc()
+        return _FakeProc(stdout=b"", stderr=b"boom", rc=1)
 
     with patch.object(claude_exec.asyncio, "create_subprocess_exec", side_effect=fake_exec):
-        result = await claude_exec.run_claude("hi", work_dir=str(tmp_path))
+        result = await claude_exec.run_claude("hi", cwd=str(tmp_path))
 
-    assert "오류" in result
-    assert "boom" in result
+    assert result.is_error
+    assert "boom" in result.text
+
+
+async def test_is_error_flag_from_json_propagates(monkeypatch, tmp_path):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    payload = json.dumps({"session_id": "s", "result": "failed halfway", "is_error": True}).encode()
+
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc(stdout=payload, rc=0)
+
+    with patch.object(claude_exec.asyncio, "create_subprocess_exec", side_effect=fake_exec):
+        result = await claude_exec.run_claude("hi", cwd=str(tmp_path))
+
+    assert result.is_error is True
+    assert result.text == "failed halfway"
