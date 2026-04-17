@@ -23,6 +23,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot/ ./bot/
 COPY executor/ ./executor/
 
+# non-root 사용자 생성 (Claude CLI 가 root 에서 --dangerously-skip-permissions 차단)
+RUN groupadd -r agent && useradd -r -g agent -m -d /home/agent agent
+
 EXPOSE 9100
 
+USER agent
 CMD ["python", "-m", "bot.main"]

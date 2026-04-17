@@ -16,7 +16,7 @@ services:
       # 레지스트리 DB / 워크플로 체크포인트
       - /volume1/docker/nas-agent/data:/app/data
       # Claude CLI 로그인 세션 영속화 (MAX 구독)
-      - /volume1/docker/nas-agent/claude-config:/root/.claude
+      - /volume1/docker/nas-agent/claude-config:/home/agent/.claude
     ports:
       - "9100:9100"
     healthcheck:

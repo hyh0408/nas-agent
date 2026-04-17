@@ -56,7 +56,7 @@ async def run_claude(
         Config.CLAUDE_CLI_PATH,
         "-p", prompt,
         "--output-format", "json",
-        "--permission-mode", "bypassPermissions",
+        "--dangerously-skip-permissions",
     ]
     if ephemeral:
         args.append("--no-session-persistence")

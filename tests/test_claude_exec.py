@@ -48,7 +48,7 @@ async def test_new_session_uses_session_id_flag(monkeypatch, tmp_path):
     assert "--session-id" in args
     assert args[args.index("--session-id") + 1] == "new-sess"
     assert "--resume" not in args
-    assert "--permission-mode" in args
+    assert "--dangerously-skip-permissions" in args
     assert result.session_id == "new-sess"
     assert result.text == "done"
     assert result.is_error is False
