@@ -83,6 +83,35 @@ async def create_repo(
     )
 
 
+async def delete_repo(
+    repo_url: str,
+    token: str,
+    *,
+    timeout: int = 30,
+) -> None:
+    """GitHub repo 를 삭제한다. repo_url 에서 owner/name 을 추출."""
+    # https://github.com/owner/name → owner/name
+    path = urlparse(repo_url).path.strip("/").rstrip(".git")
+    if not path or "/" not in path:
+        raise GitHubError(f"repo URL 에서 owner/name 을 추출할 수 없음: {repo_url}")
+
+    url = f"{GITHUB_API}/repos/{path}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+        async with session.delete(url, headers=headers) as resp:
+            if resp.status == 204:
+                return
+            if resp.status == 404:
+                return  # 이미 없음
+            body = await resp.text()
+            raise GitHubError(f"GitHub repo 삭제 실패 ({resp.status}): {body[:300]}")
+
+
 # ── git CLI ────────────────────────────────────────────────────
 
 def _remote_with_token(clone_url: str, token: str) -> str:

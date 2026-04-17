@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import defaultdict
 
 from aiohttp import web
@@ -310,18 +311,19 @@ async def cmd_projects(update: Update, context):
 async def cmd_rm(update: Update, context):
     logger.info(f"[cmd] /rm args={context.args} from={update.effective_user.id}")
     if not context.args:
-        await update.message.reply_text("사용법: /rm <프로젝트이름> [--drop-db]")
+        await update.message.reply_text("사용법: /rm <프로젝트이름>")
         return
     name = context.args[0].lower()
-    drop_db = "--drop-db" in context.args[1:]
 
     project = await registry.get(name)
     if not project:
         await update.message.reply_text(f"없는 프로젝트: {name}")
         return
 
-    db_msg = ""
-    if drop_db and project.db_name and Config.MYSQL_ROOT_PASSWORD:
+    results: list[str] = []
+
+    # 1. MySQL DB 삭제
+    if project.db_name and Config.MYSQL_ROOT_PASSWORD:
         try:
             await mysql_exec.drop(
                 name,
@@ -329,13 +331,41 @@ async def cmd_rm(update: Update, context):
                 host=Config.MYSQL_HOST,
                 port=Config.MYSQL_PORT,
             )
-            db_msg = f"\nMySQL DB '{project.db_name}' 삭제됨"
+            results.append(f"MySQL DB '{project.db_name}' 삭제됨")
+            logger.info(f"[rm] '{name}' MySQL DB 삭제 완료")
         except MySQLError as e:
-            db_msg = f"\nMySQL 삭제 실패: {e}"
+            results.append(f"MySQL 삭제 실패: {e}")
+            logger.error(f"[rm] '{name}' MySQL 삭제 실패: {e}")
 
+    # 2. GitHub repo 삭제
+    if project.repo_url and Config.GITHUB_TOKEN:
+        try:
+            from executor import github_exec
+            await github_exec.delete_repo(project.repo_url, Config.GITHUB_TOKEN)
+            results.append(f"GitHub repo 삭제됨")
+            logger.info(f"[rm] '{name}' GitHub repo 삭제 완료: {project.repo_url}")
+        except Exception as e:
+            results.append(f"GitHub 삭제 실패: {e}")
+            logger.error(f"[rm] '{name}' GitHub 삭제 실패: {e}")
+
+    # 3. 로컬 프로젝트 파일 삭제
+    import shutil
+    project_dir = os.path.join(Config.PROJECTS_DIR, name)
+    if os.path.isdir(project_dir):
+        try:
+            shutil.rmtree(project_dir)
+            results.append("로컬 파일 삭제됨")
+            logger.info(f"[rm] '{name}' 로컬 파일 삭제 완료: {project_dir}")
+        except OSError as e:
+            results.append(f"로컬 파일 삭제 실패: {e}")
+            logger.error(f"[rm] '{name}' 로컬 파일 삭제 실패: {e}")
+
+    # 4. 레지스트리 삭제
     await registry.delete(name)
-    result_msg = f"'{name}' 제거됨\n(프로젝트 파일은 그대로 남아 있습니다)" + db_msg
-    logger.info(f"[cmd] /rm '{name}' 완료{db_msg}")
+    results.append("레지스트리 제거됨")
+
+    result_msg = f"'{name}' 삭제 완료:\n" + "\n".join(f"  • {r}" for r in results)
+    logger.info(f"[cmd] /rm '{name}' 완료")
     await update.message.reply_text(result_msg)
 
 
