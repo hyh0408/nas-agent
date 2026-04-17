@@ -23,12 +23,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot/ ./bot/
 COPY executor/ ./executor/
 
-# non-root 사용자 생성 + Docker 소켓 접근용 그룹 설정
-RUN set -e; \
-    groupadd -r agent; \
-    useradd -r -g agent -m -d /home/agent agent; \
-    getent group docker >/dev/null 2>&1 || groupadd docker; \
-    usermod -aG docker agent
+# non-root 사용자 생성
+# Synology 의 docker.sock 은 root:root(0:0) 소유이므로 root 그룹에 추가
+RUN groupadd -r agent \
+    && useradd -r -g agent -m -d /home/agent agent \
+    && usermod -aG root agent
 
 EXPOSE 9100
 
