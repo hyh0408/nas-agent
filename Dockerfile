@@ -27,7 +27,7 @@ COPY executor/ ./executor/
 RUN set -e; \
     groupadd -r agent; \
     useradd -r -g agent -m -d /home/agent agent; \
-    getent group docker >/dev/null 2>&1 || groupadd -g 999 docker; \
+    getent group docker >/dev/null 2>&1 || groupadd docker; \
     usermod -aG docker agent
 
 EXPOSE 9100
