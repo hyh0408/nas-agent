@@ -1,4 +1,4 @@
-"""mysql_exec 단위 테스트 — docker/mysql 서브프로세스를 mock."""
+"""mysql_exec 단위 테스트 — mysql CLI 서브프로세스를 mock."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ class _FakeProc:
         self._out, self._err, self.returncode = out, err, rc
 
     async def communicate(self, stdin=None):
-        # stdin 는 SQL — 기록해두면 테스트에서 검증 가능
         self.last_stdin = stdin
         return (self._out, self._err)
 
@@ -54,13 +53,13 @@ async def test_provision_runs_expected_sql():
     proc = _FakeProc()
     with _patch_exec(proc):
         creds = await mysql_exec.provision(
-            "myapp", root_password="rootpw", container="nas-mysql"
+            "myapp", root_password="rootpw", host="192.168.0.100"
         )
 
     assert creds.database == "proj_myapp"
     assert creds.user == "proj_myapp"
     assert creds.password  # 자동 생성
-    assert creds.host == "nas-mysql"
+    assert creds.host == "192.168.0.100"
 
     sql = proc.last_stdin.decode()
     assert "CREATE DATABASE IF NOT EXISTS `proj_myapp`" in sql
@@ -68,14 +67,15 @@ async def test_provision_runs_expected_sql():
     assert "GRANT ALL PRIVILEGES ON `proj_myapp`.*" in sql
     assert "FLUSH PRIVILEGES" in sql
 
+    # mysql CLI 가 TCP 로 직접 접속
     args = proc.args
-    assert args[0] == "docker"
-    assert "exec" in args
-    assert "-i" in args
-    assert "nas-mysql" in args
-    assert "mysql" in args
-    # root 비밀번호는 stdin/arg 가 아닌 MYSQL_PWD env 로 전달
-    assert any("MYSQL_PWD=rootpw" == a for a in args)
+    assert args[0] == "mysql"
+    assert "-h" in args
+    assert "192.168.0.100" in args
+    assert "-uroot" in args
+    # root 비밀번호는 MYSQL_PWD env 로 전달
+    env = proc.kwargs.get("env", {})
+    assert env.get("MYSQL_PWD") == "rootpw"
 
 
 async def test_provision_raises_when_mysql_fails():

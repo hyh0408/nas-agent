@@ -1,15 +1,14 @@
-"""공유 MySQL(`nas-mysql`) 에 프로젝트 전용 database + user 를 프로비저닝한다.
+"""Synology MariaDB 에 프로젝트 전용 database + user 를 프로비저닝한다.
 
-- `docker exec -i nas-mysql mysql ...` 로 SQL 을 stdin 으로 흘려 넣어
-  패스워드가 프로세스 목록에 노출되지 않게 한다.
-- root 암호는 MYSQL_PWD 환경변수로 컨테이너 안에 전달.
-- 프로젝트 컨테이너와 nas-mysql 은 같은 외부 네트워크(`nas-agent-shared`) 에 연결되어
-  있어 hostname 'nas-mysql' 로 접근 가능.
+- NAS 호스트의 MariaDB 에 TCP 로 직접 접속 (mysql CLI).
+- root 암호는 MYSQL_PWD 환경변수로 전달 (ps 노출 방지).
+- 프로젝트 컨테이너는 NAS 호스트 IP(MYSQL_HOST) 로 DB 에 접근.
 """
 
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import secrets
 from dataclasses import dataclass
@@ -45,10 +44,9 @@ _IDENT_SAFE = re.compile(r"[^a-zA-Z0-9_]")
 def _db_ident(project_name: str) -> str:
     """MySQL 식별자로 쓸 수 있게 정규화. proj_<sanitized>."""
     sanitized = _IDENT_SAFE.sub("_", project_name).lower()
-    # 선행 숫자 방지
     if sanitized and sanitized[0].isdigit():
         sanitized = f"p{sanitized}"
-    return f"proj_{sanitized}"[:63]  # MySQL 식별자 길이 제한 64 - 1 여유
+    return f"proj_{sanitized}"[:63]
 
 
 def _gen_password() -> str:
@@ -61,19 +59,24 @@ def _gen_password() -> str:
 async def _exec_sql(
     sql: str,
     *,
-    container: str,
+    host: str,
+    port: int,
     root_password: str,
     timeout: int = 30,
 ) -> None:
-    """docker exec 으로 nas-mysql 에서 SQL 실행. 실패하면 MySQLError."""
+    """mysql CLI 로 TCP 접속해 SQL 실행. 실패하면 MySQLError."""
+    env = {**os.environ, "MYSQL_PWD": root_password}
+
     proc = await asyncio.create_subprocess_exec(
-        "docker", "exec", "-i",
-        "-e", f"MYSQL_PWD={root_password}",
-        container,
-        "mysql", "-uroot", "--batch",
+        "mysql",
+        "-h", host,
+        "-P", str(port),
+        "-uroot",
+        "--batch",
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
     try:
         stdout, stderr = await asyncio.wait_for(
@@ -92,8 +95,7 @@ async def provision(
     project_name: str,
     *,
     root_password: str,
-    container: str = "nas-mysql",
-    host: str = "nas-mysql",
+    host: str = "192.168.0.100",
     port: int = 3306,
 ) -> DBCredentials:
     """프로젝트 전용 database + user 를 생성하고 권한을 부여한다."""
@@ -103,21 +105,18 @@ async def provision(
     ident = _db_ident(project_name)
     password = _gen_password()
 
-    # secrets 로 생성한 password 는 base64 url-safe 문자만 포함해서 따옴표/백슬래시가 없지만
-    # 방어적으로 escape.
     pw_sql = password.replace("'", "''").replace("\\", "\\\\")
 
     sql = (
         f"CREATE DATABASE IF NOT EXISTS `{ident}` "
         "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n"
         f"CREATE USER IF NOT EXISTS '{ident}'@'%' IDENTIFIED BY '{pw_sql}';\n"
-        # 기존 user 의 password 를 덮어써서 재실행 시 항상 최신 값 사용.
         f"ALTER USER '{ident}'@'%' IDENTIFIED BY '{pw_sql}';\n"
         f"GRANT ALL PRIVILEGES ON `{ident}`.* TO '{ident}'@'%';\n"
         "FLUSH PRIVILEGES;\n"
     )
 
-    await _exec_sql(sql, container=container, root_password=root_password)
+    await _exec_sql(sql, host=host, port=port, root_password=root_password)
     return DBCredentials(
         host=host, port=port, database=ident, user=ident, password=password
     )
@@ -127,7 +126,8 @@ async def drop(
     project_name: str,
     *,
     root_password: str,
-    container: str = "nas-mysql",
+    host: str = "192.168.0.100",
+    port: int = 3306,
 ) -> None:
     """프로젝트 database + user 제거."""
     ident = _db_ident(project_name)
@@ -136,7 +136,7 @@ async def drop(
         f"DROP USER IF EXISTS '{ident}'@'%';\n"
         "FLUSH PRIVILEGES;\n"
     )
-    await _exec_sql(sql, container=container, root_password=root_password)
+    await _exec_sql(sql, host=host, port=port, root_password=root_password)
 
 
 def is_enabled(root_password: Optional[str]) -> bool:

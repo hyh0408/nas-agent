@@ -64,10 +64,8 @@ def _init_state() -> None:
     )
     mysql_cfg = MySQLConfig(
         root_password=Config.MYSQL_ROOT_PASSWORD,
-        container=Config.MYSQL_CONTAINER,
         host=Config.MYSQL_HOST,
         port=Config.MYSQL_PORT,
-        shared_network=Config.SHARED_NETWORK,
     )
     sa_cfg = SubAgentConfig()
     workflow = build_workflow(registry, github_cfg, mysql_cfg, sa_cfg)
@@ -321,7 +319,8 @@ async def cmd_rm(update: Update, context):
             await mysql_exec.drop(
                 name,
                 root_password=Config.MYSQL_ROOT_PASSWORD,
-                container=Config.MYSQL_CONTAINER,
+                host=Config.MYSQL_HOST,
+                port=Config.MYSQL_PORT,
             )
             db_msg = f"\nMySQL DB '{project.db_name}' 삭제됨"
         except MySQLError as e:

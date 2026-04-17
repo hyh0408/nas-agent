@@ -3,7 +3,7 @@ FROM python:3.11-slim
 # Install Docker CLI (공식 바이너리 직접 설치)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    curl git ca-certificates gnupg && \
+    curl git ca-certificates gnupg default-mysql-client && \
     # Docker CLI 바이너리 직접 다운로드
     curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.4.1.tgz | \
     tar xz --strip-components=1 -C /usr/local/bin docker/docker && \

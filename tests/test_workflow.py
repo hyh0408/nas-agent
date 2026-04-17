@@ -459,7 +459,7 @@ async def test_new_project_with_db_provisions_and_feeds_prompt(registry, project
     p = captured_prompt["p"]
     assert "proj_myapp" in p
     assert "secret123" in p
-    assert "nas-agent-shared" in p
+    assert "NAS" in p or "MariaDB" in p or "192.168" in p
 
     # 레지스트리에도 저장
     persisted = await registry.get(project_name)

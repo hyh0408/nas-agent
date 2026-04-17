@@ -187,10 +187,11 @@ nas/                              총 ~3,500줄 (프로덕션 ~2,085 + 테스트
   토큰은 `https://x-access-token:TOKEN@github.com/...` remote URL 임베드.
 - `commit_and_push()` — `status --porcelain` 으로 변경 여부 확인, 없으면 "변경 없음".
 
-### executor/mysql_exec.py (143줄)
-- `provision(project_name, *, root_password)` → `DBCredentials`.
+### executor/mysql_exec.py (130줄)
+- `provision(project_name, *, root_password, host, port)` → `DBCredentials`.
   식별자 `proj_<sanitized>`. 패스워드 `secrets.token_urlsafe(24)`.
-- `docker exec -i -e MYSQL_PWD=...` 로 SQL stdin 전달 (ps 노출 방지).
+- Synology MariaDB 에 `mysql -h <host> -P <port>` 로 TCP 직접 접속.
+  root 비번은 `MYSQL_PWD` env 로 전달 (ps 노출 방지).
 - `drop(project_name)` — database + user 삭제.
 
 ### executor/workflow.py (651줄)
@@ -211,17 +212,17 @@ nas/                              총 ~3,500줄 (프로덕션 ~2,085 + 테스트
 - 볼륨 4개: Docker 소켓, projects, data, claude-config.
 - 헬스체크: `http://localhost:9100/health` (aiohttp).
 
-### docker-compose.infra.yml (nas-mysql)
-- MySQL 8 + utf8mb4 + caching_sha2_password.
-- `nas-agent-shared` 외부 네트워크.
-- 프로젝트 컴포즈(Claude 생성)도 같은 네트워크를 external 로 참조.
+### docker-compose.infra.yml (nas-mysql) — 대체됨
+Synology MariaDB 패키지로 전환하여 더 이상 필수가 아님. 파일은 참고용으로 유지.
+프로젝트 컴포즈는 NAS 호스트 IP(`MYSQL_HOST`)로 MariaDB 에 직접 접속.
 
 ### NAS 배포 순서
 ```sh
+# 1. Synology DSM → 패키지센터 → MariaDB 10 설치 + root 비밀번호 설정
+# 2. .env 에 MYSQL_ROOT_PASSWORD, MYSQL_HOST 설정
 docker network create nas-agent-shared   # 최초 1회
 cd /volume1/docker/nas-agent
-docker compose -f docker-compose.infra.yml up -d   # MySQL (선택)
-docker compose up -d --build                        # Bot
+docker compose up -d --build             # Bot
 ```
 
 ---
@@ -242,11 +243,9 @@ docker compose up -d --build                        # Bot
 | `GITHUB_PRIVATE` | — | 기본 `true` |
 | `GIT_USER_NAME` | — | 기본 `NAS Agent` |
 | `GIT_USER_EMAIL` | — | 기본 `nas-agent@local` |
-| `MYSQL_ROOT_PASSWORD` | — | 비면 MySQL 비활성. `--db` 거절됨 |
-| `MYSQL_CONTAINER` | — | 기본 `nas-mysql` |
-| `MYSQL_HOST` | — | 기본 `nas-mysql` |
+| `MYSQL_ROOT_PASSWORD` | — | Synology MariaDB root 비번. 비면 `--db` 거절 |
+| `MYSQL_HOST` | — | 기본 NAS_HOST 값 (예: `192.168.0.100`) |
 | `MYSQL_PORT` | — | 기본 `3306` |
-| `SHARED_NETWORK` | — | 기본 `nas-agent-shared` |
 
 Sub-agent 는 환경변수 없이 **프로젝트별** `/new --agents` 로 활성화.
 
@@ -359,6 +358,7 @@ python3 -m venv .venv
 - `network_mode: bridge` — `nas-agent-shared` 외부 네트워크로 이관.
 - `docker-compose.yml` `environment:` 하드코딩 — `.env` 일원화.
 - `SUB_AGENTS_ENABLED` 글로벌 환경변수 — 프로젝트별 `--agents` 로 전환.
+- `MYSQL_CONTAINER`, `SHARED_NETWORK` 환경변수 — Synology MariaDB TCP 직접 접속으로 전환.
 
 ---
 
@@ -377,3 +377,4 @@ python3 -m venv .venv
 | 2026-04-17 | `37a4867` | Sub-agent 워크플로 (plan → code → review → fix) |
 | 2026-04-17 | `3b59162` | Sub-agent 를 프로젝트별 설정으로 전환 (/new --agents) |
 | 2026-04-17 | — | CLAUDE.md 전면 재구성: 아키텍처 다이어그램, 노드 테이블, 줄 수 갱신 |
+| 2026-04-17 | — | Synology MariaDB 전환: docker exec → mysql TCP 직접 접속 |

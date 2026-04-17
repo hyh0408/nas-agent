@@ -53,10 +53,8 @@ class GitHubConfig:
 @dataclass
 class MySQLConfig:
     root_password: str = ""
-    container: str = "nas-mysql"
-    host: str = "nas-mysql"
+    host: str = "192.168.0.100"
     port: int = 3306
-    shared_network: str = "nas-agent-shared"
 
     @property
     def enabled(self) -> bool:
@@ -199,22 +197,21 @@ FIX_PROMPT = (
 )
 
 
-def _db_prompt_section(creds: Optional[DBCredentials], shared_network: str) -> str:
+def _db_prompt_section(creds: Optional[DBCredentials]) -> str:
     if creds is None:
         return ""
     return (
-        "\n사용 가능한 MySQL 데이터베이스 (공유 nas-mysql 컨테이너):\n"
+        "\n사용 가능한 MySQL 데이터베이스 (Synology NAS MariaDB):\n"
         f"  HOST: {creds.host}\n"
         f"  PORT: {creds.port}\n"
         f"  DATABASE: {creds.database}\n"
         f"  USER: {creds.user}\n"
         f"  PASSWORD: {creds.password}\n\n"
-        f"docker-compose.yml 추가 규칙:\n"
-        f"- 최상위에 networks 섹션 정의: `{shared_network}: {{ external: true }}`\n"
-        f"- 앱 서비스에 networks: [{shared_network}] 연결\n"
+        f"docker-compose.yml 규칙:\n"
         f"- 앱 서비스 environment 에 MYSQL_HOST / MYSQL_PORT / MYSQL_DATABASE /\n"
         f"  MYSQL_USER / MYSQL_PASSWORD 를 위 값 그대로 주입\n"
-        f"- MySQL 서비스를 프로젝트에 따로 띄우지 말 것 (공유 DB 재사용)\n"
+        f"- MySQL 서비스를 프로젝트에 따로 띄우지 말 것 (NAS 호스트 MariaDB 재사용)\n"
+        f"- network_mode: bridge 또는 extra_hosts 로 NAS 호스트에 접근 가능하게 설정\n"
     )
 
 
@@ -298,7 +295,6 @@ def build_workflow(
                 creds = await mysql_exec.provision(
                     project.name,
                     root_password=my_cfg.root_password,
-                    container=my_cfg.container,
                     host=my_cfg.host,
                     port=my_cfg.port,
                 )
@@ -340,7 +336,7 @@ def build_workflow(
         project_dir = os.path.join(state["projects_dir"], project.name)
         os.makedirs(project_dir, exist_ok=True)
 
-        db_section = _db_prompt_section(state.get("db_credentials"), my_cfg.shared_network)
+        db_section = _db_prompt_section(state.get("db_credentials"))
         if state["is_new"]:
             prompt = PLAN_NEW_PROMPT.format(
                 name=project.name,
@@ -366,7 +362,7 @@ def build_workflow(
         project_dir = os.path.join(state["projects_dir"], project.name)
         os.makedirs(project_dir, exist_ok=True)
 
-        db_section = _db_prompt_section(state.get("db_credentials"), my_cfg.shared_network)
+        db_section = _db_prompt_section(state.get("db_credentials"))
         plan_output = state.get("plan_output", "")
         plan_section = (
             f"\n아래는 사전 분석(planner)의 구현 계획입니다. 이 계획을 따라 작업하세요:\n"
