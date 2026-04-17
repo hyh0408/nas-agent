@@ -24,7 +24,10 @@ COPY bot/ ./bot/
 COPY executor/ ./executor/
 
 # non-root 사용자 생성 (Claude CLI 가 root 에서 --dangerously-skip-permissions 차단)
-RUN groupadd -r agent && useradd -r -g agent -m -d /home/agent agent
+# docker 그룹(GID 를 호스트와 맞춤)에 추가해 Docker 소켓 접근 허용
+RUN groupadd -r agent && useradd -r -g agent -m -d /home/agent agent && \
+    groupadd -g 999 docker || true && \
+    usermod -aG docker agent
 
 EXPOSE 9100
 
