@@ -559,9 +559,8 @@ async def test_github_sync_skipped_when_cli_errors(registry, projects_dir):
 
 
 async def test_sub_agents_disabled_skips_plan_review_fix(registry, projects_dir):
-    """기본값(disabled) 에서 plan/review/fix 는 noop. 기존 동작과 동일."""
-    sa_cfg = wf.SubAgentConfig(enabled=False)
-    graph = wf.build_workflow(registry, sub_agents=sa_cfg)
+    """sub_agents=False 에서 plan/review/fix 는 noop. 기존 동작과 동일."""
+    graph = wf.build_workflow(registry)
     project_name = "myapp"
     _setup_compose(projects_dir, project_name)
 
@@ -571,6 +570,7 @@ async def test_sub_agents_disabled_skips_plan_review_fix(registry, projects_dir)
     with patch.object(wf, "run_claude", side_effect=fake_code), _patch_docker():
         state = await graph.ainvoke({
             "project_name": project_name, "task": "", "is_new": True,
+            "sub_agents": False,
             "description": "x", "projects_dir": projects_dir,
         })
 
@@ -582,8 +582,7 @@ async def test_sub_agents_disabled_skips_plan_review_fix(registry, projects_dir)
 
 async def test_sub_agents_enabled_runs_plan_code_review_lgtm(registry, projects_dir):
     """LGTM 리뷰 → fix 스킵."""
-    sa_cfg = wf.SubAgentConfig(enabled=True)
-    graph = wf.build_workflow(registry, sub_agents=sa_cfg)
+    graph = wf.build_workflow(registry)
     project_name = "myapp"
     _setup_compose(projects_dir, project_name)
 
@@ -602,6 +601,7 @@ async def test_sub_agents_enabled_runs_plan_code_review_lgtm(registry, projects_
     with patch.object(wf, "run_claude", side_effect=multi_claude), _patch_docker():
         state = await graph.ainvoke({
             "project_name": project_name, "task": "", "is_new": True,
+            "sub_agents": True,
             "description": "FastAPI 앱", "projects_dir": projects_dir,
         })
 
@@ -614,8 +614,7 @@ async def test_sub_agents_enabled_runs_plan_code_review_lgtm(registry, projects_
 
 async def test_sub_agents_enabled_review_issues_triggers_fix(registry, projects_dir):
     """리뷰 이슈 발견 → fix 실행."""
-    sa_cfg = wf.SubAgentConfig(enabled=True)
-    graph = wf.build_workflow(registry, sub_agents=sa_cfg)
+    graph = wf.build_workflow(registry)
     project_name = "myapp"
     _setup_compose(projects_dir, project_name)
 
@@ -637,6 +636,7 @@ async def test_sub_agents_enabled_review_issues_triggers_fix(registry, projects_
     with patch.object(wf, "run_claude", side_effect=multi_claude), _patch_docker():
         state = await graph.ainvoke({
             "project_name": project_name, "task": "", "is_new": True,
+            "sub_agents": True,
             "description": "앱", "projects_dir": projects_dir,
         })
 
@@ -648,8 +648,7 @@ async def test_sub_agents_enabled_review_issues_triggers_fix(registry, projects_
 
 async def test_sub_agents_plan_failure_still_proceeds(registry, projects_dir):
     """플래너 실패해도 코딩은 진행된다."""
-    sa_cfg = wf.SubAgentConfig(enabled=True)
-    graph = wf.build_workflow(registry, sub_agents=sa_cfg)
+    graph = wf.build_workflow(registry)
     project_name = "myapp"
     _setup_compose(projects_dir, project_name)
 
@@ -663,6 +662,7 @@ async def test_sub_agents_plan_failure_still_proceeds(registry, projects_dir):
     with patch.object(wf, "run_claude", side_effect=multi_claude), _patch_docker():
         state = await graph.ainvoke({
             "project_name": project_name, "task": "", "is_new": True,
+            "sub_agents": True,
             "description": "앱", "projects_dir": projects_dir,
         })
 
@@ -673,9 +673,8 @@ async def test_sub_agents_plan_failure_still_proceeds(registry, projects_dir):
 
 async def test_sub_agents_continue_project_uses_resume(registry, projects_dir):
     """이어작업 시에도 sub-agent 작동, coder 는 resume=True."""
-    sa_cfg = wf.SubAgentConfig(enabled=True)
-    graph = wf.build_workflow(registry, sub_agents=sa_cfg)
-    p = await registry.create("myapp", "x")
+    graph = wf.build_workflow(registry)
+    p = await registry.create("myapp", "x", sub_agents=True)
     _setup_compose(projects_dir, "myapp")
 
     captured = {}
@@ -695,11 +694,14 @@ async def test_sub_agents_continue_project_uses_resume(registry, projects_dir):
     with patch.object(wf, "run_claude", side_effect=multi_claude), _patch_docker():
         state = await graph.ainvoke({
             "project_name": "myapp", "task": "로그인", "is_new": False,
+            "sub_agents": True,
             "description": "", "projects_dir": projects_dir,
         })
 
     assert captured["resume"] is True
     assert captured["session_id"] == p.session_id
+    # 이어작업에서 프로젝트의 sub_agents=True 가 state 에 반영되었는지 확인
+    assert state.get("sub_agents") is True
 
 
 # ── 헬퍼 ────────────────────────────────────────────────────

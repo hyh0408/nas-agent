@@ -63,6 +63,11 @@ executor/workflow.py  LangGraph StateGraph (10 노드)
 | Fixer | Coder 세션 resume | 리뷰 이슈 수정. LGTM 이면 noop. | 10분 |
 
 MAX 구독 쿼터가 3~4배 소비되므로 필요할 때만 활성화.
+
+**프로젝트별 설정**: `/new <name> --agents <desc>` 로 생성하면 `projects.sub_agents=1`
+이 저장되어 이후 `/work` 시에도 자동으로 sub-agent 경로를 탄다. `_agents_on(state)`
+가 `state["sub_agents"]` 를 확인하고, 이 값은 `load` 노드에서 프로젝트 레코드로부터
+주입된다. 전역 env 설정 없이 프로젝트 단위로 판단.
 Planner 실패 시에도 코딩은 계속 진행(graceful degradation).
 
 ## 파일 구조
@@ -133,7 +138,7 @@ nas/
 - `_init_schema()` 에서 `PRAGMA table_info` 로 누락 컬럼(`repo_url`, `db_name`,
   `db_user`, `db_password`) 을 `ALTER TABLE ADD COLUMN` 으로 마이그레이션.
 - `Project` dataclass 필드: name, description, session_id, created_at, updated_at,
-  repo_url, db_name, db_user, db_password.
+  repo_url, db_name, db_user, db_password, sub_agents.
 
 ### executor/github_exec.py
 - `create_repo()` — aiohttp 로 GitHub REST API (`POST /user/repos` 또는 `/orgs/{owner}/repos`).
@@ -193,7 +198,6 @@ docker compose up -d --build                        # Bot
 | `GITHUB_PRIVATE` | — | 기본 `true` |
 | `GIT_USER_NAME` | — | 기본 `NAS Agent` |
 | `GIT_USER_EMAIL` | — | 기본 `nas-agent@local` |
-| `SUB_AGENTS_ENABLED` | — | 기본 `false`. plan→code→review→fix 4단계 활성 |
 | `MYSQL_ROOT_PASSWORD` | — | 비면 MySQL 연동 비활성 |
 | `MYSQL_CONTAINER` | — | 기본 `nas-mysql` |
 | `MYSQL_HOST` | — | 기본 `nas-mysql` |
@@ -204,7 +208,7 @@ docker compose up -d --build                        # Bot
 
 ```
 ── 프로젝트 ─────────────
-/new <이름> [--db] <설명>   새 프로젝트 생성 + 자동 배포 (--db: MySQL 함께)
+/new <이름> [--db] [--agents] <설명>   새 프로젝트 (--db: MySQL, --agents: sub-agent)
 /work <이름> <작업>          이어서 개발 (세션 resume → 재배포 → commit/push)
 /info <이름>                 메타 + 최근 task 5건 + repo URL + DB 이름
 /projects                    프로젝트 목록
@@ -297,3 +301,4 @@ python3 -m venv .venv
 | 2026-04-16 | `bd48f42` | 프로젝트별 CLAUDE.md 자동 생성/유지 규칙 |
 | 2026-04-17 | — | CLAUDE.md 전면 갱신, 자동 갱신 정책 명시 |
 | 2026-04-17 | — | Sub-agent 워크플로 (plan → code → review → fix). ephemeral CLI 세션 |
+| 2026-04-17 | — | Sub-agent 를 프로젝트별 설정으로 전환 (/new --agents, registry 저장) |

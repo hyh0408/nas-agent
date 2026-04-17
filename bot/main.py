@@ -69,12 +69,12 @@ def _init_state() -> None:
         port=Config.MYSQL_PORT,
         shared_network=Config.SHARED_NETWORK,
     )
-    sa_cfg = SubAgentConfig(enabled=Config.SUB_AGENTS_ENABLED)
+    sa_cfg = SubAgentConfig()
     workflow = build_workflow(registry, github_cfg, mysql_cfg, sa_cfg)
     logger.info(
         f"GitHub: {'ON' if github_cfg.enabled else 'OFF'} | "
         f"MySQL: {'ON' if mysql_cfg.enabled else 'OFF'} | "
-        f"SubAgents: {'ON' if sa_cfg.enabled else 'OFF'}"
+        f"SubAgents: per-project (--agents)"
     )
 
 
@@ -101,6 +101,7 @@ async def _run_workflow_and_reply(
     task: str = "",
     description: str = "",
     db_required: bool = False,
+    sub_agents: bool = False,
 ):
     lock = _project_locks[project_name]
     if lock.locked():
@@ -111,7 +112,12 @@ async def _run_workflow_and_reply(
 
     async with lock:
         action_label = "생성" if is_new else "작업"
-        extras = " (+MySQL DB)" if is_new and db_required else ""
+        parts = []
+        if is_new and db_required:
+            parts.append("MySQL DB")
+        if sub_agents:
+            parts.append("sub-agents")
+        extras = f" (+{', '.join(parts)})" if parts else ""
         await update.message.reply_text(
             f"🔨 '{project_name}' {action_label}{extras} 시작. 완료까지 몇 분 걸릴 수 있습니다."
         )
@@ -122,6 +128,7 @@ async def _run_workflow_and_reply(
                 "is_new": is_new,
                 "description": description,
                 "db_required": db_required,
+                "sub_agents": sub_agents,
                 "projects_dir": Config.PROJECTS_DIR,
             })
         except Exception as e:
@@ -139,7 +146,7 @@ async def cmd_start(update: Update, context):
     await update.message.reply_text(
         "NAS Agent Bot\n\n"
         "── 프로젝트 ─────────────\n"
-        "/new <이름> [--db] <설명>  - 새 프로젝트 생성 + 자동 배포 (--db: MySQL DB 함께)\n"
+        "/new <이름> [--db] [--agents] <설명>  - 새 프로젝트 (--db: MySQL, --agents: 리뷰)\n"
         "/work <이름> <작업>       - 기존 프로젝트 이어서 개발 + 재배포\n"
         "/info <이름>              - 프로젝트 상태·히스토리\n"
         "/projects                 - 프로젝트 목록\n"
@@ -197,16 +204,23 @@ async def cmd_restart(update: Update, context):
 async def cmd_new(update: Update, context):
     if len(context.args) < 2:
         await update.message.reply_text(
-            "사용법: /new <이름> [--db] <설명>\n"
-            "  --db 지정 시 MySQL database 를 자동 생성해 프로젝트에 연결"
+            "사용법: /new <이름> [--db] [--agents] <설명>\n"
+            "  --db      MySQL database 자동 생성\n"
+            "  --agents  plan→code→review→fix sub-agent 활성"
         )
         return
     name = context.args[0].lower()
     rest = list(context.args[1:])
     db_required = False
-    if rest and rest[0] == "--db":
-        db_required = True
-        rest = rest[1:]
+    use_agents = False
+    # 플래그 파싱 (순서 무관)
+    flags = {"--db", "--agents"}
+    while rest and rest[0] in flags:
+        flag = rest.pop(0)
+        if flag == "--db":
+            db_required = True
+        elif flag == "--agents":
+            use_agents = True
     if not rest:
         await update.message.reply_text("설명이 비어 있습니다.")
         return
@@ -222,6 +236,7 @@ async def cmd_new(update: Update, context):
         is_new=True,
         description=description,
         db_required=db_required,
+        sub_agents=use_agents,
     )
 
 
@@ -232,7 +247,13 @@ async def cmd_work(update: Update, context):
         return
     name = context.args[0].lower()
     task = " ".join(context.args[1:])
-    await _run_workflow_and_reply(update, project_name=name, is_new=False, task=task)
+    # 프로젝트에 저장된 sub_agents 설정 미리 로드 (workflow load 에서도 하지만
+    # _run_workflow_and_reply 메시지에 표시하기 위해)
+    project = await registry.get(name)
+    use_agents = project.sub_agents if project else False
+    await _run_workflow_and_reply(
+        update, project_name=name, is_new=False, task=task, sub_agents=use_agents
+    )
 
 
 @authorized
@@ -257,6 +278,8 @@ async def cmd_info(update: Update, context):
         lines.append(f"repo: {project.repo_url}")
     if project.db_name:
         lines.append(f"DB: {project.db_name} (user {project.db_user})")
+    if project.sub_agents:
+        lines.append("agents: plan→code→review→fix")
     lines.extend(["", "최근 작업:"])
     if not history:
         lines.append("(아직 없음)")
@@ -338,11 +361,13 @@ async def handle_message(update: Update, context):
                 db_required=bool(classified.get("db_required")),
             )
         else:
+            proj = await registry.get(classified["name"])
             await _run_workflow_and_reply(
                 update,
                 project_name=classified["name"],
                 is_new=False,
                 task=classified["task"],
+                sub_agents=proj.sub_agents if proj else False,
             )
         return
 

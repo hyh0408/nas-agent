@@ -80,7 +80,8 @@ class WorkflowState(TypedDict, total=False):
     is_new: bool
     description: str
     projects_dir: str
-    db_required: bool  # /new --db 또는 자연어 DB 키워드
+    db_required: bool      # /new --db 또는 자연어 DB 키워드
+    sub_agents: bool       # 프로젝트별 sub-agent 사용 여부
 
     # 중간 / 출력
     project: Optional[Project]
@@ -237,7 +238,10 @@ def build_workflow(
             if state["is_new"]:
                 if existing:
                     return {"error": f"이미 존재하는 프로젝트: {name}", "status": "error"}
-                project = await registry.create(name, state.get("description", ""))
+                use_agents = state.get("sub_agents", False)
+                project = await registry.create(
+                    name, state.get("description", ""), sub_agents=use_agents
+                )
             else:
                 if not existing:
                     return {
@@ -247,7 +251,12 @@ def build_workflow(
                 project = existing
         except ProjectError as e:
             return {"error": str(e), "status": "error"}
-        return {"project": project, "status": "loaded"}
+        # 이어작업 시 프로젝트에 저장된 sub_agents 설정을 state 에 반영
+        return {
+            "project": project,
+            "sub_agents": project.sub_agents,
+            "status": "loaded",
+        }
 
     async def github_init(state: WorkflowState) -> dict:
         """새 프로젝트일 때만 GitHub repo 를 만든다."""
@@ -318,9 +327,12 @@ def build_workflow(
             return {"db_credentials": creds}
         return {}
 
+    def _agents_on(state: WorkflowState) -> bool:
+        return bool(state.get("sub_agents", False))
+
     async def plan(state: WorkflowState) -> dict:
         """(sub-agent) 구현 계획을 세운다. 비활성이면 noop."""
-        if not sa_cfg.enabled:
+        if not _agents_on(state):
             return {}
         if state.get("error"):
             return {}
@@ -391,7 +403,7 @@ def build_workflow(
 
     async def review(state: WorkflowState) -> dict:
         """(sub-agent) 코드 리뷰. 비활성이면 noop."""
-        if not sa_cfg.enabled:
+        if not _agents_on(state):
             return {"review_passed": True}
         cli = state.get("cli_result")
         if cli is None or cli.is_error:
@@ -414,7 +426,7 @@ def build_workflow(
 
     async def fix(state: WorkflowState) -> dict:
         """(sub-agent) 리뷰 이슈 수정. LGTM 이면 noop."""
-        if not sa_cfg.enabled or state.get("review_passed", True):
+        if not _agents_on(state) or state.get("review_passed", True):
             return {}
 
         project: Project = state["project"]

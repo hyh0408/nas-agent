@@ -34,6 +34,7 @@ class Project:
     db_name: Optional[str] = None
     db_user: Optional[str] = None
     db_password: Optional[str] = None
+    sub_agents: bool = False
 
 
 @dataclass
@@ -100,41 +101,51 @@ class ProjectRegistry:
             for col in ("repo_url", "db_name", "db_user", "db_password"):
                 if col not in cols:
                     conn.execute(f"ALTER TABLE projects ADD COLUMN {col} TEXT")
+            if "sub_agents" not in cols:
+                conn.execute(
+                    "ALTER TABLE projects ADD COLUMN sub_agents INTEGER NOT NULL DEFAULT 0"
+                )
 
     # ── 동기 구현 ─────────────────────────────────────────────
 
-    def _create_sync(self, name: str, description: str) -> Project:
+    def _create_sync(self, name: str, description: str, sub_agents: bool = False) -> Project:
         validate_name(name)
         now = _utcnow()
         session_id = str(uuid.uuid4())
         with self._connect() as conn:
             try:
                 conn.execute(
-                    "INSERT INTO projects (name, description, session_id, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (name, description, session_id, now, now),
+                    "INSERT INTO projects (name, description, session_id, created_at, updated_at, sub_agents) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (name, description, session_id, now, now, 1 if sub_agents else 0),
                 )
             except sqlite3.IntegrityError as e:
                 raise ProjectError(f"이미 존재하는 프로젝트: {name}") from e
-        return Project(name, description, session_id, now, now)
+        return Project(name, description, session_id, now, now, sub_agents=sub_agents)
 
     _SELECT = (
         "SELECT name, description, session_id, created_at, updated_at, "
-        "repo_url, db_name, db_user, db_password "
+        "repo_url, db_name, db_user, db_password, sub_agents "
         "FROM projects"
     )
+
+    @staticmethod
+    def _row_to_project(row) -> Project:
+        d = dict(row)
+        d["sub_agents"] = bool(d.get("sub_agents", 0))
+        return Project(**d)
 
     def _get_sync(self, name: str) -> Optional[Project]:
         with self._connect() as conn:
             row = conn.execute(f"{self._SELECT} WHERE name = ?", (name,)).fetchone()
         if not row:
             return None
-        return Project(**dict(row))
+        return self._row_to_project(row)
 
     def _list_sync(self) -> list[Project]:
         with self._connect() as conn:
             rows = conn.execute(f"{self._SELECT} ORDER BY updated_at DESC").fetchall()
-        return [Project(**dict(r)) for r in rows]
+        return [self._row_to_project(r) for r in rows]
 
     def _touch_sync(self, name: str) -> None:
         with self._connect() as conn:
@@ -200,8 +211,8 @@ class ProjectRegistry:
 
     # ── async 래퍼 ────────────────────────────────────────────
 
-    async def create(self, name: str, description: str) -> Project:
-        return await asyncio.to_thread(self._create_sync, name, description)
+    async def create(self, name: str, description: str, sub_agents: bool = False) -> Project:
+        return await asyncio.to_thread(self._create_sync, name, description, sub_agents)
 
     async def get(self, name: str) -> Optional[Project]:
         return await asyncio.to_thread(self._get_sync, name)

@@ -25,9 +25,6 @@ class Config:
     GIT_USER_NAME: str = os.environ.get("GIT_USER_NAME", "NAS Agent")
     GIT_USER_EMAIL: str = os.environ.get("GIT_USER_EMAIL", "nas-agent@local")
 
-    # Sub-agent (선택). plan → code → review → fix 4단계 워크플로.
-    SUB_AGENTS_ENABLED: bool = os.environ.get("SUB_AGENTS_ENABLED", "false").lower() == "true"
-
     # MySQL 연동 (선택). MYSQL_ROOT_PASSWORD 비면 --db 요청이 거절됨.
     MYSQL_ROOT_PASSWORD: str = os.environ.get("MYSQL_ROOT_PASSWORD", "")
     MYSQL_CONTAINER: str = os.environ.get("MYSQL_CONTAINER", "nas-mysql")
