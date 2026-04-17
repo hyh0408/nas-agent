@@ -33,6 +33,7 @@ from executor.workflow import (
     format_workflow_result,
     GitHubConfig,
     MySQLConfig,
+    SubAgentConfig,
 )
 
 logging.basicConfig(
@@ -68,10 +69,12 @@ def _init_state() -> None:
         port=Config.MYSQL_PORT,
         shared_network=Config.SHARED_NETWORK,
     )
-    workflow = build_workflow(registry, github_cfg, mysql_cfg)
+    sa_cfg = SubAgentConfig(enabled=Config.SUB_AGENTS_ENABLED)
+    workflow = build_workflow(registry, github_cfg, mysql_cfg, sa_cfg)
     logger.info(
         f"GitHub: {'ON' if github_cfg.enabled else 'OFF'} | "
-        f"MySQL: {'ON' if mysql_cfg.enabled else 'OFF'}"
+        f"MySQL: {'ON' if mysql_cfg.enabled else 'OFF'} | "
+        f"SubAgents: {'ON' if sa_cfg.enabled else 'OFF'}"
     )
 
 

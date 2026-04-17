@@ -555,3 +555,158 @@ async def test_github_sync_skipped_when_cli_errors(registry, projects_dir):
     assert "CLI 오류" in state["github_output"]
 
 
+# ── Sub-agent 경로 ────────────────────────────────────────────
+
+
+async def test_sub_agents_disabled_skips_plan_review_fix(registry, projects_dir):
+    """기본값(disabled) 에서 plan/review/fix 는 noop. 기존 동작과 동일."""
+    sa_cfg = wf.SubAgentConfig(enabled=False)
+    graph = wf.build_workflow(registry, sub_agents=sa_cfg)
+    project_name = "myapp"
+    _setup_compose(projects_dir, project_name)
+
+    async def fake_code(prompt, **kwargs):
+        return ClaudeResult(session_id="s", text="ok", is_error=False, raw={})
+
+    with patch.object(wf, "run_claude", side_effect=fake_code), _patch_docker():
+        state = await graph.ainvoke({
+            "project_name": project_name, "task": "", "is_new": True,
+            "description": "x", "projects_dir": projects_dir,
+        })
+
+    assert state["cli_result"].text == "ok"
+    assert state.get("review_passed") is True
+    assert state.get("plan_output") in (None, "", {})
+    assert state["deployed"] is True
+
+
+async def test_sub_agents_enabled_runs_plan_code_review_lgtm(registry, projects_dir):
+    """LGTM 리뷰 → fix 스킵."""
+    sa_cfg = wf.SubAgentConfig(enabled=True)
+    graph = wf.build_workflow(registry, sub_agents=sa_cfg)
+    project_name = "myapp"
+    _setup_compose(projects_dir, project_name)
+
+    call_log = []
+
+    async def multi_claude(prompt, *, cwd, ephemeral=False, timeout=900, **kwargs):
+        if "계획만 출력" in prompt:
+            call_log.append("plan")
+            return ClaudeResult(session_id="", text="1. FastAPI 사용\n2. main.py 생성", is_error=False, raw={})
+        if "코드를 리뷰" in prompt:
+            call_log.append("review")
+            return ClaudeResult(session_id="", text="LGTM — 깔끔합니다", is_error=False, raw={})
+        call_log.append("code")
+        return ClaudeResult(session_id="s", text="코드 생성 완료", is_error=False, raw={})
+
+    with patch.object(wf, "run_claude", side_effect=multi_claude), _patch_docker():
+        state = await graph.ainvoke({
+            "project_name": project_name, "task": "", "is_new": True,
+            "description": "FastAPI 앱", "projects_dir": projects_dir,
+        })
+
+    assert call_log == ["plan", "code", "review"]
+    assert "FastAPI 사용" in state["plan_output"]
+    assert state["review_passed"] is True
+    assert state["cli_result"].text == "코드 생성 완료"
+    assert state["deployed"] is True
+
+
+async def test_sub_agents_enabled_review_issues_triggers_fix(registry, projects_dir):
+    """리뷰 이슈 발견 → fix 실행."""
+    sa_cfg = wf.SubAgentConfig(enabled=True)
+    graph = wf.build_workflow(registry, sub_agents=sa_cfg)
+    project_name = "myapp"
+    _setup_compose(projects_dir, project_name)
+
+    call_log = []
+
+    async def multi_claude(prompt, *, cwd, ephemeral=False, timeout=900, **kwargs):
+        if "계획만 출력" in prompt:
+            call_log.append("plan")
+            return ClaudeResult(session_id="", text="계획", is_error=False, raw={})
+        if "코드를 리뷰" in prompt:
+            call_log.append("review")
+            return ClaudeResult(session_id="", text="1. port 가 하드코딩됨\n2. 에러핸들링 누락", is_error=False, raw={})
+        if "리뷰어가 다음 문제를 발견" in prompt:
+            call_log.append("fix")
+            return ClaudeResult(session_id="s", text="수정 완료", is_error=False, raw={})
+        call_log.append("code")
+        return ClaudeResult(session_id="s", text="코드 생성", is_error=False, raw={})
+
+    with patch.object(wf, "run_claude", side_effect=multi_claude), _patch_docker():
+        state = await graph.ainvoke({
+            "project_name": project_name, "task": "", "is_new": True,
+            "description": "앱", "projects_dir": projects_dir,
+        })
+
+    assert call_log == ["plan", "code", "review", "fix"]
+    assert state["review_passed"] is False
+    assert state.get("fix_result").text == "수정 완료"
+    assert state["deployed"] is True
+
+
+async def test_sub_agents_plan_failure_still_proceeds(registry, projects_dir):
+    """플래너 실패해도 코딩은 진행된다."""
+    sa_cfg = wf.SubAgentConfig(enabled=True)
+    graph = wf.build_workflow(registry, sub_agents=sa_cfg)
+    project_name = "myapp"
+    _setup_compose(projects_dir, project_name)
+
+    async def multi_claude(prompt, *, cwd, ephemeral=False, timeout=900, **kwargs):
+        if "계획만 출력" in prompt:
+            return ClaudeResult(session_id="", text="에러남", is_error=True, raw={})
+        if "코드를 리뷰" in prompt:
+            return ClaudeResult(session_id="", text="LGTM", is_error=False, raw={})
+        return ClaudeResult(session_id="s", text="그래도 만듦", is_error=False, raw={})
+
+    with patch.object(wf, "run_claude", side_effect=multi_claude), _patch_docker():
+        state = await graph.ainvoke({
+            "project_name": project_name, "task": "", "is_new": True,
+            "description": "앱", "projects_dir": projects_dir,
+        })
+
+    assert state["plan_output"] == ""
+    assert state["cli_result"].text == "그래도 만듦"
+    assert state["deployed"] is True
+
+
+async def test_sub_agents_continue_project_uses_resume(registry, projects_dir):
+    """이어작업 시에도 sub-agent 작동, coder 는 resume=True."""
+    sa_cfg = wf.SubAgentConfig(enabled=True)
+    graph = wf.build_workflow(registry, sub_agents=sa_cfg)
+    p = await registry.create("myapp", "x")
+    _setup_compose(projects_dir, "myapp")
+
+    captured = {}
+
+    async def multi_claude(prompt, *, cwd, session_id=None, resume=False, ephemeral=False, **kwargs):
+        if "계획만 출력" in prompt:
+            assert ephemeral is True
+            return ClaudeResult(session_id="", text="계획", is_error=False, raw={})
+        if "코드를 리뷰" in prompt:
+            assert ephemeral is True
+            return ClaudeResult(session_id="", text="LGTM", is_error=False, raw={})
+        # coder
+        captured["resume"] = resume
+        captured["session_id"] = session_id
+        return ClaudeResult(session_id=session_id, text="이어서 했음", is_error=False, raw={})
+
+    with patch.object(wf, "run_claude", side_effect=multi_claude), _patch_docker():
+        state = await graph.ainvoke({
+            "project_name": "myapp", "task": "로그인", "is_new": False,
+            "description": "", "projects_dir": projects_dir,
+        })
+
+    assert captured["resume"] is True
+    assert captured["session_id"] == p.session_id
+
+
+# ── 헬퍼 ────────────────────────────────────────────────────
+
+
+def _setup_compose(projects_dir, name):
+    d = os.path.join(projects_dir, name)
+    os.makedirs(d, exist_ok=True)
+    with open(os.path.join(d, "docker-compose.yml"), "w") as f:
+        f.write("services: {}")

@@ -1,12 +1,20 @@
 """LangGraph 기반 프로젝트 개발 워크플로.
 
-한 번의 사용자 요청 = 한 번의 그래프 실행. 노드:
+한 번의 사용자 요청 = 한 번의 그래프 실행.
+
+노드:
   load         - 레지스트리에서 프로젝트 조회 또는 생성
   github_init  - (선택) 새 프로젝트일 때 GitHub repo 생성
-  claude       - Claude CLI 로 코드 생성/수정 (세션 resume)
+  provision_db - (선택) MySQL database + user 생성
+  plan         - (선택, sub-agent) 기존 코드 분석 → 구현 계획
+  code         - Claude CLI 로 코드 생성/수정 (세션 resume)
+  review       - (선택, sub-agent) 코드 리뷰 → LGTM 또는 이슈 리포트
+  fix          - (선택, sub-agent) 리뷰 이슈 수정 (coder 세션 resume)
   deploy       - docker compose up -d --build 로 자동 배포
   github_sync  - (선택) 코드 변경사항을 git commit + push
   persist      - task 히스토리 기록
+
+SUB_AGENTS_ENABLED=false (기본값) 이면 plan/review/fix 는 noop.
 """
 
 from __future__ import annotations
@@ -55,6 +63,16 @@ class MySQLConfig:
         return mysql_exec.is_enabled(self.root_password)
 
 
+@dataclass
+class SubAgentConfig:
+    enabled: bool = False
+
+    # 각 agent 타임아웃 (초)
+    plan_timeout: int = 300
+    review_timeout: int = 300
+    fix_timeout: int = 600
+
+
 class WorkflowState(TypedDict, total=False):
     # 입력
     project_name: str
@@ -66,7 +84,11 @@ class WorkflowState(TypedDict, total=False):
 
     # 중간 / 출력
     project: Optional[Project]
+    plan_output: str               # planner agent 출력
     cli_result: Optional[ClaudeResult]
+    review_output: str             # reviewer agent 출력
+    review_passed: bool            # LGTM 여부
+    fix_result: Optional[ClaudeResult]
     deploy_output: str
     deployed: bool
     github_output: str
@@ -128,6 +150,54 @@ CONTINUE_PROJECT_PROMPT = (
 )
 
 
+PLAN_NEW_PROMPT = (
+    "프로젝트 '{name}' 를 새로 만들기 위한 **구현 계획**을 작성하세요.\n"
+    "설명: {description}\n"
+    "{db_section}"
+    "\n아래 항목을 한국어로 출력하세요:\n"
+    "1. 기술 스택 선택 근거\n"
+    "2. 디렉터리·파일 구조\n"
+    "3. 각 파일의 핵심 역할 (1줄)\n"
+    "4. Dockerfile / docker-compose.yml 설계\n"
+    "5. 주의사항·엣지 케이스\n\n"
+    "**파일을 생성하거나 수정하지 마세요.** 계획만 출력합니다."
+)
+
+PLAN_CONTINUE_PROMPT = (
+    "프로젝트 '{name}' 에 대해 다음 작업의 **구현 계획**을 작성하세요.\n"
+    "요청: {task}\n"
+    "{db_section}"
+    "\n현재 디렉터리의 코드를 읽고 아래 항목을 한국어로 출력하세요:\n"
+    "1. 수정/생성할 파일 목록\n"
+    "2. 각 파일의 변경 내용 요약\n"
+    "3. 기존 코드와의 호환성 고려사항\n"
+    "4. 예상 위험·엣지 케이스\n\n"
+    "**파일을 생성하거나 수정하지 마세요.** 계획만 출력합니다."
+)
+
+REVIEW_PROMPT = (
+    "프로젝트 '{name}' 의 코드를 리뷰하세요.\n\n"
+    "현재 디렉터리에 있는 파일들을 읽고 다음을 확인하세요:\n"
+    "1. 버그 가능성·로직 오류\n"
+    "2. Dockerfile / docker-compose.yml 올바른지\n"
+    "3. 보안 취약점 (하드코딩된 비밀, SQL 인젝션 등)\n"
+    "4. 기존 코드와의 불일치\n\n"
+    "문제가 없으면 첫 줄에 **LGTM** 이라고 쓰고 간단히 요약.\n"
+    "문제가 있으면 각 이슈를 번호로 나열하고 수정 방법을 구체적으로 작성.\n\n"
+    "**파일을 수정하지 마세요.** 리뷰만 출력합니다."
+)
+
+FIX_PROMPT = (
+    "프로젝트 '{name}' 의 리뷰어가 다음 문제를 발견했습니다:\n\n"
+    "{review_output}\n\n"
+    "위 모든 문제를 수정하세요.\n"
+    "작업 규칙:\n"
+    "- 기존 파일 구조/스타일 유지\n"
+    "- git 작업 직접 하지 마세요\n"
+    "- 마지막에 한국어로 수정 내역을 요약"
+)
+
+
 def _db_prompt_section(creds: Optional[DBCredentials], shared_network: str) -> str:
     if creds is None:
         return ""
@@ -151,12 +221,14 @@ def build_workflow(
     registry: ProjectRegistry,
     github: Optional[GitHubConfig] = None,
     mysql: Optional[MySQLConfig] = None,
+    sub_agents: Optional[SubAgentConfig] = None,
     *,
     deploy_timeout: int = 600,
 ):
-    """레지스트리·GitHub·MySQL 설정을 클로저로 바인딩한 컴파일된 그래프를 돌려준다."""
+    """레지스트리·GitHub·MySQL·Sub-agent 설정을 클로저로 바인딩한 컴파일된 그래프를 돌려준다."""
     gh_cfg = github or GitHubConfig()
     my_cfg = mysql or MySQLConfig()
+    sa_cfg = sub_agents or SubAgentConfig()
 
     async def load(state: WorkflowState) -> dict:
         name = state["project_name"]
@@ -246,19 +318,56 @@ def build_workflow(
             return {"db_credentials": creds}
         return {}
 
-    async def claude(state: WorkflowState) -> dict:
+    async def plan(state: WorkflowState) -> dict:
+        """(sub-agent) 구현 계획을 세운다. 비활성이면 noop."""
+        if not sa_cfg.enabled:
+            return {}
+        if state.get("error"):
+            return {}
         project: Project = state["project"]
         project_dir = os.path.join(state["projects_dir"], project.name)
         os.makedirs(project_dir, exist_ok=True)
 
         db_section = _db_prompt_section(state.get("db_credentials"), my_cfg.shared_network)
         if state["is_new"]:
+            prompt = PLAN_NEW_PROMPT.format(
+                name=project.name,
+                description=state.get("description", ""),
+                db_section=db_section,
+            )
+        else:
+            prompt = PLAN_CONTINUE_PROMPT.format(
+                name=project.name, task=state["task"], db_section=db_section,
+            )
+
+        result = await run_claude(
+            prompt, cwd=project_dir, ephemeral=True, timeout=sa_cfg.plan_timeout,
+        )
+        if result.is_error:
+            logger.warning(f"planner 실패: {result.text[:200]}")
+            return {"plan_output": ""}  # 계획 실패해도 코딩은 진행
+        return {"plan_output": result.text}
+
+    async def code(state: WorkflowState) -> dict:
+        """메인 코딩 agent. plan_output 이 있으면 프롬프트에 포함."""
+        project: Project = state["project"]
+        project_dir = os.path.join(state["projects_dir"], project.name)
+        os.makedirs(project_dir, exist_ok=True)
+
+        db_section = _db_prompt_section(state.get("db_credentials"), my_cfg.shared_network)
+        plan_output = state.get("plan_output", "")
+        plan_section = (
+            f"\n아래는 사전 분석(planner)의 구현 계획입니다. 이 계획을 따라 작업하세요:\n"
+            f"---\n{plan_output}\n---\n"
+        ) if plan_output else ""
+
+        if state["is_new"]:
             prompt = NEW_PROJECT_PROMPT.format(
                 name=project.name,
                 description=state.get("description", ""),
                 db_section=db_section,
                 claude_md_rules=CLAUDE_MD_RULES_NEW,
-            )
+            ) + plan_section
             resume = False
         else:
             prompt = CONTINUE_PROJECT_PROMPT.format(
@@ -266,7 +375,7 @@ def build_workflow(
                 task=state["task"],
                 db_section=db_section,
                 claude_md_rules=CLAUDE_MD_RULES_CONTINUE,
-            )
+            ) + plan_section
             resume = True
 
         result = await run_claude(
@@ -280,8 +389,56 @@ def build_workflow(
             "status": "cli_error" if result.is_error else "coded",
         }
 
-    async def deploy(state: WorkflowState) -> dict:
+    async def review(state: WorkflowState) -> dict:
+        """(sub-agent) 코드 리뷰. 비활성이면 noop."""
+        if not sa_cfg.enabled:
+            return {"review_passed": True}
         cli = state.get("cli_result")
+        if cli is None or cli.is_error:
+            return {"review_passed": True}  # 코딩 실패 시 리뷰 건너뜀
+
+        project: Project = state["project"]
+        project_dir = os.path.join(state["projects_dir"], project.name)
+
+        prompt = REVIEW_PROMPT.format(name=project.name)
+        result = await run_claude(
+            prompt, cwd=project_dir, ephemeral=True, timeout=sa_cfg.review_timeout,
+        )
+        if result.is_error:
+            logger.warning(f"reviewer 실패: {result.text[:200]}")
+            return {"review_passed": True, "review_output": ""}
+
+        text = result.text.strip()
+        passed = text.upper().startswith("LGTM")
+        return {"review_output": text, "review_passed": passed}
+
+    async def fix(state: WorkflowState) -> dict:
+        """(sub-agent) 리뷰 이슈 수정. LGTM 이면 noop."""
+        if not sa_cfg.enabled or state.get("review_passed", True):
+            return {}
+
+        project: Project = state["project"]
+        project_dir = os.path.join(state["projects_dir"], project.name)
+
+        prompt = FIX_PROMPT.format(
+            name=project.name,
+            review_output=state.get("review_output", ""),
+        )
+        result = await run_claude(
+            prompt,
+            cwd=project_dir,
+            session_id=project.session_id,
+            resume=True,
+            timeout=sa_cfg.fix_timeout,
+        )
+        return {
+            "fix_result": result,
+            "status": "fix_error" if result.is_error else "fixed",
+        }
+
+    async def deploy(state: WorkflowState) -> dict:
+        # 코딩·수정 결과 중 최종 성공 여부 판단
+        cli = state.get("fix_result") or state.get("cli_result")
         if cli is None or cli.is_error:
             return {"deployed": False, "deploy_output": "CLI 오류로 배포 건너뜀"}
 
@@ -382,13 +539,16 @@ def build_workflow(
 
     def route_after_db(state: WorkflowState) -> str:
         # DB 프로비저닝 실패는 치명적 — 바로 persist 로 가서 기록 후 종료
-        return "persist" if state.get("error") else "claude"
+        return "persist" if state.get("error") else "plan"
 
     g = StateGraph(WorkflowState)
     g.add_node("load", load)
     g.add_node("github_init", github_init)
     g.add_node("provision_db", provision_db)
-    g.add_node("claude", claude)
+    g.add_node("plan", plan)
+    g.add_node("code", code)
+    g.add_node("review", review)
+    g.add_node("fix", fix)
     g.add_node("deploy", deploy)
     g.add_node("github_sync", github_sync)
     g.add_node("persist", persist)
@@ -399,9 +559,12 @@ def build_workflow(
     )
     g.add_edge("github_init", "provision_db")
     g.add_conditional_edges(
-        "provision_db", route_after_db, {"claude": "claude", "persist": "persist"}
+        "provision_db", route_after_db, {"plan": "plan", "persist": "persist"}
     )
-    g.add_edge("claude", "deploy")
+    g.add_edge("plan", "code")
+    g.add_edge("code", "review")
+    g.add_edge("review", "fix")
+    g.add_edge("fix", "deploy")
     g.add_edge("deploy", "github_sync")
     g.add_edge("github_sync", "persist")
     g.add_edge("persist", END)
@@ -438,6 +601,15 @@ def format_workflow_result(state: WorkflowState) -> str:
     if gh_output:
         icon = "✅" if state.get("github_pushed") else "ℹ️"
         parts.append(f"{icon} GitHub: {gh_output}")
+
+    review_output = state.get("review_output")
+    if review_output:
+        passed = state.get("review_passed", True)
+        icon = "✅" if passed else "🔧"
+        parts.append(f"{icon} 리뷰: {_tail(review_output, 300)}")
+    fix = state.get("fix_result")
+    if fix and not fix.is_error:
+        parts.append(f"🔧 수정 완료: {_tail(fix.text, 200)}")
 
     db_output = state.get("db_output")
     if db_output:

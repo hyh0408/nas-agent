@@ -33,6 +33,7 @@ async def run_claude(
     session_id: Optional[str] = None,
     resume: bool = False,
     timeout: int = 900,
+    ephemeral: bool = False,
 ) -> ClaudeResult:
     """Claude CLI 를 한 번 실행한다.
 
@@ -43,6 +44,8 @@ async def run_claude(
             기존 세션 UUID 를 전달한다.
         resume: True 면 --resume, False 면 --session-id 로 신규 생성.
         timeout: 초. 기본 15분.
+        ephemeral: True 면 --no-session-persistence 추가. planner/reviewer 등
+            일회성 sub-agent 에 사용.
     """
     os.makedirs(cwd, exist_ok=True)
 
@@ -53,10 +56,11 @@ async def run_claude(
         Config.CLAUDE_CLI_PATH,
         "-p", prompt,
         "--output-format", "json",
-        # 자동화된 실행이므로 파일/명령 권한 프롬프트를 건너뛴다.
         "--permission-mode", "bypassPermissions",
     ]
-    if session_id:
+    if ephemeral:
+        args.append("--no-session-persistence")
+    if session_id and not ephemeral:
         args += (["--resume", session_id] if resume else ["--session-id", session_id])
 
     proc = await asyncio.create_subprocess_exec(
