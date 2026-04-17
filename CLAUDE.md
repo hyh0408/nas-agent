@@ -9,9 +9,16 @@
 
 **NAS Agent** — Synology NAS 위에서 돌아가는 Telegram 봇. 사용자가 자연어/슬래시
 커맨드로 요청을 보내면 **LangGraph 워크플로**가 Claude Code CLI 를 구동해
-프로젝트를 만들고 수정하고 배포한다. 하나의 프로젝트에는 **하나의 장수 Claude CLI
-세션**(UUID 로 식별)이 이어져서, 후속 `/work` 요청이 이전 대화 맥락을 그대로
-물려받는다. GitHub 자동 push 와 공유 MySQL 프로비저닝도 선택적으로 연동된다.
+프로젝트를 만들고 수정하고 배포한다.
+
+### 핵심 특징
+- **장수 세션**: 프로젝트마다 고유 Claude CLI 세션(UUID). `/work` 시 `--resume` 으로
+  이전 대화 맥락을 이어받음
+- **자동 배포**: 코드 생성 후 `docker compose up -d --build` 자동 실행
+- **GitHub 연동**: repo 자동 생성, 매 작업 후 commit + push (선택)
+- **공유 MySQL**: `nas-mysql` 컨테이너에 프로젝트별 database/user 자동 프로비저닝 (선택)
+- **Sub-agent**: 프로젝트별로 plan → code → review → fix 4단계 품질 워크플로 (선택)
+- **프로젝트별 CLAUDE.md**: 워크플로가 각 프로젝트에 요구사항 기반 문서를 자동 생성/유지
 
 ## 절대 원칙
 
@@ -23,164 +30,201 @@
 | **CLI 는 `--permission-mode bypassPermissions`** | 자동화라 사용자 승인 프롬프트가 불가. |
 | **이 CLAUDE.md 를 항상 최신 상태로 유지** | 코드 변경 시 관련 섹션도 갱신. 테스트 수·구조·명령어·환경변수 등. |
 
+---
+
 ## 아키텍처
 
+### 전체 흐름
+
 ```
-Telegram (long polling)
-   ↓
-bot/main.py          핸들러 + /new /work /info /rm /projects /sys /status /logs /stop /restart
-   ↓
-bot/classifier.py    규칙 기반 라우팅 (simple / project / chat / complex)
-   ↓
-executor/workflow.py  LangGraph StateGraph (10 노드)
-   ├─ load            registry 조회/생성
-   ├─ github_init     GitHub 빈 repo 생성 (is_new + GITHUB_TOKEN)
-   ├─ provision_db    MySQL database + user 생성 (is_new + db_required + MYSQL_ROOT_PASSWORD)
-   ├─ plan            (sub-agent, 선택) 기존 코드 분석 → 구현 계획 [ephemeral]
-   ├─ code            Claude CLI 로 코드 생성/수정 (세션 resume). plan 결과 주입
-   ├─ review          (sub-agent, 선택) 코드 리뷰 → LGTM 또는 이슈 [ephemeral]
-   ├─ fix             (sub-agent, 선택) 리뷰 이슈 수정 (coder 세션 resume)
-   ├─ deploy          docker compose -p <name> up -d --build
-   ├─ github_sync     git init(최초 1회) + add/commit/push
-   └─ persist         task 히스토리 기록
+┌─────────┐      ┌───────────┐      ┌──────────────┐
+│ Telegram │ ───→ │ classifier│ ───→ │  LangGraph   │
+│ Bot      │      │ (규칙)    │      │  Workflow    │
+└─────────┘      └───────────┘      └──────┬───────┘
+                                            │
+                  ┌─────────────────────────┘
+                  │
+    ┌─────────────┼──────────────────────────────────────────────┐
+    │             ▼                                              │
+    │   ┌──────┐  ┌───────────┐  ┌─────────────┐                │
+    │   │ load │→│github_init │→│ provision_db │                │
+    │   └──────┘  └───────────┘  └──────┬──────┘                │
+    │                                    │                       │
+    │             ┌──────────────────────┘                       │
+    │             ▼                                              │
+    │   ┌──────┐  ┌──────┐  ┌────────┐  ┌─────┐                │
+    │   │ plan │→│ code │→│ review │→│ fix │  ← sub-agent     │
+    │   └──────┘  └──────┘  └────────┘  └──┬──┘  (프로젝트별)   │
+    │                                       │                    │
+    │             ┌─────────────────────────┘                    │
+    │             ▼                                              │
+    │   ┌────────┐  ┌─────────────┐  ┌─────────┐               │
+    │   │ deploy │→│ github_sync │→│ persist │→ END            │
+    │   └────────┘  └─────────────┘  └─────────┘               │
+    │                                                            │
+    │                    StateGraph (10 노드)                     │
+    └────────────────────────────────────────────────────────────┘
 ```
 
-**조건부 라우팅**
-- `load` 에서 에러 → 즉시 `END` (프로젝트 없음/중복 등)
-- `provision_db` 에서 에러 → `persist` 로 점프 (실패도 히스토리에 기록)
-- 각 선택적 노드(github_init, provision_db, github_sync) 는 설정 토큰이 없으면
-  `{}` 반환해 noop.
+### 노드 역할
 
-**Sub-agent 워크플로 (SUB_AGENTS_ENABLED=true)**
+| 노드 | 역할 | 조건 |
+|------|------|------|
+| `load` | 레지스트리 조회(continue) 또는 생성(new). sub_agents 플래그를 state 에 주입. | 항상 실행. 에러 시 즉시 END. |
+| `github_init` | GitHub 빈 repo 생성 + repo_url 저장 | is_new + GITHUB_TOKEN |
+| `provision_db` | MySQL database + user 프로비저닝. 자격증명 registry 저장. | is_new + db_required + MYSQL_ROOT_PASSWORD. 에러 시 persist 로 점프. |
+| `plan` | **(sub-agent)** 기존 코드 분석 → 구현 계획. 일회용(ephemeral). | project.sub_agents = true |
+| `code` | 메인 코딩. plan 결과가 있으면 프롬프트에 주입. 장수 세션 resume. | 항상 실행. |
+| `review` | **(sub-agent)** 코드 리뷰. LGTM 또는 이슈 리포트. 일회용. | project.sub_agents = true |
+| `fix` | **(sub-agent)** 리뷰 이슈 수정. coder 세션 resume. | sub_agents + review NOT LGTM |
+| `deploy` | `docker compose -p <name> up -d --build`. compose 없으면 스킵. | CLI 성공 시 |
+| `github_sync` | git init(최초) + add -A + commit + push | GITHUB_TOKEN + repo_url 존재 + CLI 성공 |
+| `persist` | task 히스토리를 registry 에 기록 | 항상 실행 (에러 포함) |
 
-`plan → code → review → fix` 4단계. 비활성(기본값)이면 `plan`/`review`/`fix`가 noop.
+### 선택적 노드의 noop 패턴
 
-| Agent | 세션 | 역할 | Timeout |
-|-------|------|------|---------|
-| Planner | 일회용 (`--no-session-persistence`) | 코드 분석 → 구현 계획. 파일 수정 금지. | 5분 |
-| Coder | 프로젝트 장수 세션 (resume) | 계획 기반 코드 작성. plan_output 이 있으면 프롬프트에 포함. | 15분 |
-| Reviewer | 일회용 | 코드 리뷰. 첫 줄 "LGTM" → pass, 아니면 이슈 리포트. | 5분 |
-| Fixer | Coder 세션 resume | 리뷰 이슈 수정. LGTM 이면 noop. | 10분 |
+설정이 비활성이면 `{}` 반환. LangGraph 가 state 를 머지할 때 빈 dict 는 아무것도
+변경하지 않으므로, 그래프 edge 를 조건부로 잘라낼 필요 없이 선형 체인으로 유지.
 
-MAX 구독 쿼터가 3~4배 소비되므로 필요할 때만 활성화.
+### Sub-agent 상세
 
-**프로젝트별 설정**: `/new <name> --agents <desc>` 로 생성하면 `projects.sub_agents=1`
-이 저장되어 이후 `/work` 시에도 자동으로 sub-agent 경로를 탄다. `_agents_on(state)`
-가 `state["sub_agents"]` 를 확인하고, 이 값은 `load` 노드에서 프로젝트 레코드로부터
-주입된다. 전역 env 설정 없이 프로젝트 단위로 판단.
-Planner 실패 시에도 코딩은 계속 진행(graceful degradation).
+| Agent | 세션 | CLI 플래그 | Timeout | 실패 시 |
+|-------|------|-----------|---------|---------|
+| Planner | 일회용 | `--no-session-persistence` | 5분 | 계획 없이 코딩 속행 (graceful) |
+| Coder | 장수 세션 | `--session-id` / `--resume` | 15분 | 에러 반환 → deploy 스킵 |
+| Reviewer | 일회용 | `--no-session-persistence` | 5분 | LGTM 으로 간주 |
+| Fixer | Coder 세션 resume | `--resume` | 10분 | 에러 반환 |
+
+**프로젝트별 설정**: `/new <name> --agents <desc>` → `projects.sub_agents=1` 저장.
+이후 `/work` 시 `load` 노드가 프로젝트 레코드의 `sub_agents` 를 state 에 주입 →
+plan/review/fix 노드가 `_agents_on(state)` 로 확인.
+
+---
 
 ## 파일 구조
 
 ```
-nas/
-├── bot/
-│   ├── main.py          Telegram 핸들러, 워크플로 연결, 지연 초기화 (_init_state)
-│   ├── classifier.py    classify(msg, known_projects) → 라우팅 dict
-│   └── config.py        모든 환경변수 → Config 클래스 (37줄)
-├── executor/
-│   ├── claude_exec.py   run_claude() → ClaudeResult (--output-format json 파싱)
-│   ├── docker_exec.py   container_status/logs/stop/restart, deploy_project, system_status
-│   ├── github_exec.py   create_repo (REST), ensure_git_initialized, commit_and_push
-│   ├── mysql_exec.py    provision / drop (docker exec -i nas-mysql mysql)
-│   ├── projects.py      SQLite 레지스트리 (Project + TaskRecord), 스키마 마이그레이션
-│   └── workflow.py      LangGraph StateGraph, 프롬프트 상수, format_workflow_result
-├── tests/               94 케이스, pytest + pytest-asyncio (auto mode)
-│   ├── conftest.py      TELEGRAM_BOT_TOKEN 등 env 설정
-│   ├── test_classifier.py
-│   ├── test_claude_exec.py
-│   ├── test_github_exec.py
-│   ├── test_mysql_exec.py
-│   ├── test_projects.py
-│   └── test_workflow.py
-├── docker-compose.yml        nas-agent 본체 (nas-agent-shared 네트워크)
-├── docker-compose.infra.yml  nas-mysql (공유 DB 인프라)
-├── Dockerfile                python:3.11-slim + Node 20 + Claude CLI + Docker CLI
-├── requirements.txt          python-telegram-bot, aiohttp, pydantic, python-dotenv, langgraph
-├── pytest.ini
-└── CLAUDE.md                 ← 이 파일
+nas/                              총 ~3,500줄 (프로덕션 ~2,085 + 테스트 ~1,409)
+│
+├── bot/                          Telegram 인터페이스 (~640줄)
+│   ├── main.py         (464)    핸들러, _init_state() 지연 초기화, _run_workflow_and_reply()
+│   ├── classifier.py   (140)    classify(msg, known_projects) → routing dict
+│   └── config.py        (37)    환경변수 → Config 클래스
+│
+├── executor/                     비즈니스 로직 (~1,445줄)
+│   ├── workflow.py     (651)    LangGraph StateGraph 10노드, 프롬프트 상수, format_result
+│   ├── projects.py     (245)    SQLite 레지스트리 (Project + TaskRecord + 스키마 마이그레이션)
+│   ├── github_exec.py  (180)    REST API repo 생성, git CLI init/commit/push
+│   ├── mysql_exec.py   (143)    docker exec 으로 MySQL 프로비저닝/삭제
+│   ├── docker_exec.py  (113)    container 상태/로그/중지/재시작, system_status
+│   └── claude_exec.py  (112)    run_claude() → ClaudeResult (session/ephemeral 지원)
+│
+├── tests/                        99 케이스 (~1,409줄), pytest + pytest-asyncio (auto mode)
+│   ├── test_workflow.py   (714)  워크플로 e2e (sub-agent/GitHub/MySQL 경로 포함)
+│   ├── test_github_exec.py(226)  aiohttp mock + git subprocess mock
+│   ├── test_claude_exec.py(146)  CLI 플래그/env/timeout/JSON 파싱
+│   ├── test_mysql_exec.py (116)  docker exec mock, SQL 검증
+│   ├── test_classifier.py (115)  28 케이스 (NL 분류 + DB 키워드 + 한글 경계)
+│   ├── test_projects.py    (88)  CRUD, 마이그레이션, validate_name
+│   └── conftest.py          (4)  TELEGRAM_BOT_TOKEN 등 env 고정
+│
+├── docker-compose.yml            nas-agent 본체 (nas-agent-shared 네트워크)
+├── docker-compose.infra.yml      nas-mysql (MySQL 8, utf8mb4, 공유 DB)
+├── Dockerfile                    python:3.11-slim + Node 20 + Claude CLI + Docker CLI
+├── requirements.txt              python-telegram-bot, aiohttp, pydantic, python-dotenv, langgraph
+├── pytest.ini                    asyncio_mode = auto
+├── .env.example                  모든 환경변수 템플릿
+└── CLAUDE.md                     ← 이 파일
 ```
 
-총 **~3,100줄** (프로덕션 ~1,860 + 테스트 ~1,250).
+---
 
 ## 영속 상태
 
 | 컨테이너 경로 | NAS 호스트 마운트 | 내용 |
 |---|---|---|
-| `/app/data/registry.db` | `/volume1/docker/nas-agent/data/` | SQLite: projects (name, description, session_id, repo_url, db_*) + tasks |
-| `/app/projects/<name>/` | `/volume1/docker/nas-agent/projects/` | 프로젝트 소스코드 + `.git/` |
-| `/root/.claude/` | `/volume1/docker/nas-agent/claude-config/` | CLI 로그인 세션 + per-project 대화 세션 |
+| `/app/data/registry.db` | `/volume1/docker/nas-agent/data/` | SQLite: projects 테이블(name, description, session_id, repo_url, db_name, db_user, db_password, sub_agents) + tasks 테이블(히스토리) |
+| `/app/projects/<name>/` | `/volume1/docker/nas-agent/projects/` | 프로젝트 소스코드, docker-compose.yml, CLAUDE.md, `.git/` |
+| `/root/.claude/` | `/volume1/docker/nas-agent/claude-config/` | Claude CLI MAX 구독 세션 + per-project 대화 세션 |
+
+---
 
 ## 주요 모듈 상세
 
-### bot/main.py
-- `_init_state()` 에서 Registry → GitHubConfig → MySQLConfig → `build_workflow()` 지연 초기화.
-  모듈 import 시점에 `/app/data` 를 만들면 테스트가 깨지므로 반드시 지연.
+### bot/main.py (464줄)
+- `_init_state()` 에서 Registry → GitHubConfig → MySQLConfig → SubAgentConfig →
+  `build_workflow()` 지연 초기화. 모듈 import 시점에 `/app/data` 를 만들면 테스트가 깨짐.
 - 프로젝트당 `asyncio.Lock` 으로 동시 요청 직렬화 (CLI 세션 충돌 방지).
-- `_run_workflow_and_reply()` 가 모든 프로젝트 작업의 공통 진입점.
+- `_run_workflow_and_reply()` 가 모든 프로젝트 작업의 공통 진입점. `sub_agents` 플래그를
+  `/new --agents` 에서 파싱하거나 `/work` 에서 프로젝트 레코드로부터 로드.
+- `/rm --drop-db`: 레지스트리 삭제 + MySQL database/user 삭제.
 
-### bot/classifier.py
-- `classify(message, known_projects)` — 순수 함수, async 래퍼 `classify_async` 도 제공.
+### bot/classifier.py (140줄)
+- `classify(message, known_projects)` — 순수 함수.
 - 우선순위: greeting → system_status → list_projects → **new project 정규식** →
   simple target actions(logs/stop/restart) → **project continue**(known_projects 매칭)
   → container status → complex fallback.
-- `로그` 는 `블로그/로그인` 오탐 방지로 한글 경계 lookbehind + 조사 lookahead.
-- `DB_KEYWORD` 로 자연어에서 "db/mysql/데이터베이스" 감지 → `db_required: True`.
+- `로그` 는 `블로그/로그인` 오탐 방지로 한글 lookbehind + 조사 lookahead.
+- `DB_KEYWORD` 로 자연어 "db/mysql/데이터베이스" → `db_required: True`.
 
-### executor/claude_exec.py
-- `run_claude(prompt, *, cwd, session_id, resume, timeout)` → `ClaudeResult`.
-- 새 세션: `--session-id <uuid>` (미리 생성한 UUID). 이어받기: `--resume <uuid>`.
+### executor/claude_exec.py (112줄)
+- `run_claude(prompt, *, cwd, session_id, resume, timeout, ephemeral)` → `ClaudeResult`.
+- 새 세션: `--session-id <uuid>`. 이어받기: `--resume <uuid>`. 일회용: `--no-session-persistence`.
 - `--output-format json` → `{session_id, result, is_error}` 파싱.
-- env 에서 `ANTHROPIC_API_KEY` 필터링하여 MAX 구독만 사용 강제.
+- env 에서 `ANTHROPIC_API_KEY` 필터링.
 
-### executor/projects.py
+### executor/projects.py (245줄)
 - 동기 sqlite3 + `asyncio.to_thread` 래퍼.
-- `_init_schema()` 에서 `PRAGMA table_info` 로 누락 컬럼(`repo_url`, `db_name`,
-  `db_user`, `db_password`) 을 `ALTER TABLE ADD COLUMN` 으로 마이그레이션.
-- `Project` dataclass 필드: name, description, session_id, created_at, updated_at,
+- `_init_schema()`: `PRAGMA table_info` → 누락 컬럼 `ALTER TABLE ADD COLUMN` 마이그레이션.
+- `_row_to_project()`: `sub_agents` INTEGER → Python `bool` 변환.
+- `Project` dataclass: name, description, session_id, created_at, updated_at,
   repo_url, db_name, db_user, db_password, sub_agents.
+- `create(..., sub_agents=False)` → `--agents` 플래그 반영.
 
-### executor/github_exec.py
-- `create_repo()` — aiohttp 로 GitHub REST API (`POST /user/repos` 또는 `/orgs/{owner}/repos`).
-- `ensure_git_initialized()` — `.git/` 없으면 init + remote add, 있으면 remote set-url.
-  토큰은 `https://x-access-token:TOKEN@github.com/...` 으로 remote URL 에 임베드.
-- `commit_and_push(project_dir, message)` — `status --porcelain` 으로 변경 여부 확인,
-  없으면 "변경 없음" 반환.
+### executor/github_exec.py (180줄)
+- `create_repo()` — aiohttp GitHub REST API. user/org 자동 분기.
+- `ensure_git_initialized()` — .git 유무로 init/set-url 분기.
+  토큰은 `https://x-access-token:TOKEN@github.com/...` remote URL 임베드.
+- `commit_and_push()` — `status --porcelain` 으로 변경 여부 확인, 없으면 "변경 없음".
 
-### executor/mysql_exec.py
+### executor/mysql_exec.py (143줄)
 - `provision(project_name, *, root_password)` → `DBCredentials`.
-  식별자 `proj_<sanitized>`, 패스워드 `secrets.token_urlsafe(24)`.
-- `docker exec -i -e MYSQL_PWD=... nas-mysql mysql -uroot` 로 SQL 을 stdin 에 전달
-  (ps 노출 방지).
-- `drop(project_name, *, root_password)` — database + user 삭제.
+  식별자 `proj_<sanitized>`. 패스워드 `secrets.token_urlsafe(24)`.
+- `docker exec -i -e MYSQL_PWD=...` 로 SQL stdin 전달 (ps 노출 방지).
+- `drop(project_name)` — database + user 삭제.
 
-### executor/workflow.py
-- `build_workflow(registry, github_cfg, mysql_cfg, sub_agents_cfg)` — 클로저로 DI, `StateGraph` 컴파일.
-- `WorkflowState` 는 `TypedDict(total=False)` — 각 노드가 부분 dict 만 반환.
-- 프롬프트 상수: `NEW_PROJECT_PROMPT`, `CONTINUE_PROJECT_PROMPT`, `CLAUDE_MD_RULES_NEW`,
-  `CLAUDE_MD_RULES_CONTINUE`, `_db_prompt_section()`.
-- `format_workflow_result(state)` → 텔레그램 응답 문자열 (3,500자 상한).
+### executor/workflow.py (651줄)
+- `build_workflow(registry, github_cfg, mysql_cfg, sub_agents_cfg)` — 클로저 DI.
+- `WorkflowState(TypedDict, total=False)` — 입력 7개 + 중간/출력 14개 필드.
+- 프롬프트 상수 8개: `NEW_PROJECT_PROMPT`, `CONTINUE_PROJECT_PROMPT`,
+  `CLAUDE_MD_RULES_NEW`, `CLAUDE_MD_RULES_CONTINUE`, `PLAN_NEW_PROMPT`,
+  `PLAN_CONTINUE_PROMPT`, `REVIEW_PROMPT`, `FIX_PROMPT`.
+- `_db_prompt_section()`: DB 자격증명 + 네트워크 규칙을 프롬프트에 주입.
+- `format_workflow_result(state)` → 텔레그램 응답 (3,500자 상한, 리뷰/수정/배포/GitHub 상태 표시).
+
+---
 
 ## 인프라 구성
 
 ### docker-compose.yml (nas-agent)
 - `nas-agent-shared` 외부 네트워크에 연결.
-- 볼륨: Docker 소켓, projects, data, claude-config.
-- 헬스체크: `http://localhost:9100/health`.
+- 볼륨 4개: Docker 소켓, projects, data, claude-config.
+- 헬스체크: `http://localhost:9100/health` (aiohttp).
 
 ### docker-compose.infra.yml (nas-mysql)
-- MySQL 8 + utf8mb4. `nas-agent-shared` 외부 네트워크.
-- 최초 1회 `docker network create nas-agent-shared` 필요.
-- 프로젝트 컴포즈(Claude 생성)도 같은 네트워크를 external 로 참조해
-  `nas-mysql` hostname 으로 DB 접근.
+- MySQL 8 + utf8mb4 + caching_sha2_password.
+- `nas-agent-shared` 외부 네트워크.
+- 프로젝트 컴포즈(Claude 생성)도 같은 네트워크를 external 로 참조.
 
 ### NAS 배포 순서
 ```sh
 docker network create nas-agent-shared   # 최초 1회
 cd /volume1/docker/nas-agent
-docker compose -f docker-compose.infra.yml up -d   # MySQL
+docker compose -f docker-compose.infra.yml up -d   # MySQL (선택)
 docker compose up -d --build                        # Bot
 ```
+
+---
 
 ## 환경변수 (.env)
 
@@ -193,61 +237,89 @@ docker compose up -d --build                        # Bot
 | `DATA_DIR` | — | 기본 `/app/data` |
 | `NAS_HOST` | — | 기본 `nas.local` |
 | `HEALTH_PORT` | — | 기본 `9100` |
-| `GITHUB_TOKEN` | — | PAT (repo 스코프). 비면 GitHub 연동 비활성 |
+| `GITHUB_TOKEN` | — | PAT (repo 스코프). 비면 GitHub 비활성 |
 | `GITHUB_OWNER` | — | 비면 토큰 소유자 user repo |
 | `GITHUB_PRIVATE` | — | 기본 `true` |
 | `GIT_USER_NAME` | — | 기본 `NAS Agent` |
 | `GIT_USER_EMAIL` | — | 기본 `nas-agent@local` |
-| `MYSQL_ROOT_PASSWORD` | — | 비면 MySQL 연동 비활성 |
+| `MYSQL_ROOT_PASSWORD` | — | 비면 MySQL 비활성. `--db` 거절됨 |
 | `MYSQL_CONTAINER` | — | 기본 `nas-mysql` |
 | `MYSQL_HOST` | — | 기본 `nas-mysql` |
 | `MYSQL_PORT` | — | 기본 `3306` |
 | `SHARED_NETWORK` | — | 기본 `nas-agent-shared` |
 
+Sub-agent 는 환경변수 없이 **프로젝트별** `/new --agents` 로 활성화.
+
+---
+
 ## Telegram UX
 
 ```
-── 프로젝트 ─────────────
-/new <이름> [--db] [--agents] <설명>   새 프로젝트 (--db: MySQL, --agents: sub-agent)
-/work <이름> <작업>          이어서 개발 (세션 resume → 재배포 → commit/push)
-/info <이름>                 메타 + 최근 task 5건 + repo URL + DB 이름
-/projects                    프로젝트 목록
-/rm <이름> [--drop-db]       레지스트리 제거 (--drop-db: MySQL DB 도 삭제)
+── 프로젝트 ──────────────────────────────────────────────────────
+/new <이름> [--db] [--agents] <설명>
+    새 프로젝트. --db: MySQL, --agents: plan→code→review→fix
+/work <이름> <작업>
+    이어서 개발 (세션 resume → 재배포 → commit/push)
+    sub_agents 는 프로젝트 설정에서 자동 로드
+/info <이름>
+    메타 + 최근 task 5건 + repo URL + DB 이름 + agents 여부
+/projects
+    레지스트리 목록
+/rm <이름> [--drop-db]
+    레지스트리 제거. --drop-db: MySQL DB 도 삭제
 
-── 컨테이너 ─────────────
-/sys                        NAS 리소스 상태 (CPU/MEM/DISK)
-/status                     실행 중 컨테이너 목록
-/logs <컨테이너>             최근 30줄 로그
-/stop <컨테이너>             중지
-/restart <컨테이너>          재시작
+── 컨테이너 ──────────────────────────────────────────────────────
+/sys                 NAS 리소스 상태 (CPU/MEM/DISK/컨테이너 수)
+/status              실행 중 컨테이너 목록
+/logs <컨테이너>      최근 30줄 로그
+/stop <컨테이너>      중지
+/restart <컨테이너>   재시작
 ```
 
-자연어도 동작: 첫 토큰이 등록 프로젝트 이름이면 `/work` 로 라우팅.
-"db/mysql/데이터베이스" 키워드 포함 시 `db_required` 자동 감지.
+**자연어 매핑**:
+- 첫 토큰이 등록 프로젝트 이름 → `/work` 라우팅
+- "db/mysql/데이터베이스" 포함 → `db_required` 자동 감지
+- "프로젝트 X 만들어줘" → `/new` 라우팅
+
+---
 
 ## 프로젝트별 CLAUDE.md (워크플로가 자동 생성/유지)
 
-`/new` 실행 시 스캐폴드에 **프로젝트 루트의 CLAUDE.md** 가 반드시 포함되고,
-`/work` 실행 시 같은 파일이 업데이트된다.
+`/new` 실행 시 Claude 가 프로젝트 루트에 **CLAUDE.md** 를 반드시 생성하고,
+`/work` 실행 시 같은 파일을 업데이트한다.
 
-프롬프트 규칙은 `executor/workflow.py` 상단 상수:
-- `CLAUDE_MD_RULES_NEW` — 신규: 개요 / 원본 요구사항 / 기술 스택 / 파일 구조 /
-  실행·배포 / 환경변수 / 데이터 모델 / 변경 이력
-- `CLAUDE_MD_RULES_CONTINUE` — 이어받기: 원본 요구사항 유지, 관련 섹션 최신화,
-  변경 이력 맨 위에 `[YYYY-MM-DD] <요청>` 한 줄 추가
-- Sub-agent 프롬프트: `PLAN_NEW_PROMPT`, `PLAN_CONTINUE_PROMPT`, `REVIEW_PROMPT`, `FIX_PROMPT`
+### 프롬프트 규칙 (executor/workflow.py)
 
-이 CLAUDE.md 는 미래 Claude 세션이 읽는 컨텍스트이므로, 규칙 변경 시 신규/이어받기
-양쪽 호환성을 챙길 것.
+**`CLAUDE_MD_RULES_NEW` (신규)**:
+1. 프로젝트 개요 — 목적, 해결하는 문제, 주요 사용자
+2. 원본 요구사항 — 사용자의 최초 설명을 그대로 인용
+3. 기술 스택
+4. 파일 구조 — 주요 디렉터리·파일 한 줄 설명
+5. 실행·배포 — 로컬/NAS docker compose 명령
+6. 환경변수 — 이름·용도·필수 여부
+7. 데이터 모델 — (DB 가 있으면) 테이블·주요 필드
+8. 변경 이력 — [YYYY-MM-DD] 형식
+
+**`CLAUDE_MD_RULES_CONTINUE` (이어받기)**:
+- 원본 요구사항 유지
+- 기술 스택·파일 구조·데이터 모델은 변경 시 최신화
+- 변경 이력 맨 위에 `[오늘 날짜] <이번 요청>` 추가
+
+**추가 sub-agent 프롬프트**: `PLAN_NEW_PROMPT`, `PLAN_CONTINUE_PROMPT`,
+`REVIEW_PROMPT`, `FIX_PROMPT`.
+
+---
 
 ## 테스트
 
-- **pytest + pytest-asyncio** (auto mode). 설정은 `pytest.ini`.
-- `tests/conftest.py` 가 `TELEGRAM_BOT_TOKEN` 등 필수 env 를 세팅.
-- 서브프로세스(`claude`, `git`, `docker`, `mysql`) 는 전부 `unittest.mock.patch` 로
-  치환. 실제 CLI/네트워크 호출 금지.
-- 비동기 Mock: `side_effect` 에 반드시 `async def` 함수를 쓸 것. sync lambda 로
-  코루틴을 돌려주면 await 시 unwrap 안 되는 버그.
+- **pytest + pytest-asyncio** (auto mode). 설정: `pytest.ini`.
+- `tests/conftest.py` 가 `TELEGRAM_BOT_TOKEN` 등 필수 env 세팅.
+- 서브프로세스(`claude`, `git`, `docker`, `mysql`) 전부 `unittest.mock.patch` 치환.
+  실제 CLI/네트워크 호출 금지.
+- **비동기 Mock**: `side_effect` 에 반드시 `async def` 함수 사용. sync lambda 로
+  코루틴 돌려주면 await 시 unwrap 안 됨.
+- **multi_claude 패턴**: sub-agent 테스트에서 prompt 키워드로 agent 구분.
+  "계획만 출력" → planner, "코드를 리뷰" → reviewer, "리뷰어가 다음 문제" → fixer.
 
 ```sh
 python3 -m venv .venv
@@ -257,35 +329,38 @@ python3 -m venv .venv
 
 현재 **99 케이스**, ~0.5초.
 
+---
+
 ## 코드 컨벤션
 
 - Python 3.11. `from __future__ import annotations` 로 타입힌트.
-- 에러는 한국어 사용자 메시지, 디버깅 세부는 `logger.exception` 으로 stderr 에만.
-- 서브프로세스 stdout/stderr: `decode(errors="replace")`.
-- 긴 출력: `_truncate`/`_tail` 헬퍼로 텔레그램 4,096자 제한 전에 압축.
+- 에러: 한국어 사용자 메시지 + `logger.exception` 으로 stderr 디버깅.
+- 서브프로세스: `decode(errors="replace")`.
+- 긴 출력: `_truncate`/`_tail` 헬퍼로 텔레그램 4,096자 전에 압축.
 - `TypedDict(total=False)` 사용 시 `dict.get(key)` 로 접근.
+- 새 연동 패턴: `executor/<name>_exec.py` + `is_enabled(token)` + `@dataclass Config` +
+  `WorkflowState` 필드 + noop 노드.
+
+---
 
 ## 변경 시 주의
 
-- **레지스트리 스키마 변경**: `executor/projects.py::_init_schema` 의 마이그레이션
-  블록에서 `PRAGMA table_info` → `ALTER TABLE ADD COLUMN`. `CREATE TABLE IF NOT
-  EXISTS` 는 기존 DB 를 안 건드림.
-- **워크플로 노드 추가**: `WorkflowState` 에 필드 추가 → 노드 함수 작성 →
-  `g.add_node` + edge 배선. 비활성 경로에서는 `{}` 반환.
-- **Claude 프롬프트 수정**: 자동화 항목(git, 배포, CLAUDE.md) 은 "직접 하지 말라"
-  규칙 유지. Claude 가 `git commit` 하면 workflow commit 이 빈 커밋이 됨.
-- **새 연동 추가**: `executor/<name>_exec.py` + `is_enabled(token)` 패턴 →
-  `WorkflowState` 필드 추가 → `build_workflow` 에 설정 객체 주입 → 토큰 없을 때
-  noop.
-- **이 CLAUDE.md 갱신**: 코드 변경 커밋 전에 관련 섹션(파일 구조, 환경변수, 테스트
-  수, Telegram UX 등) 을 최신화할 것.
+- **레지스트리 스키마**: `_init_schema` 에서 `PRAGMA table_info` → `ALTER TABLE ADD COLUMN`.
+- **워크플로 노드 추가**: `WorkflowState` 필드 → 노드 함수 → `g.add_node` + edge.
+  비활성 경로 `{}` 반환.
+- **Claude 프롬프트**: 자동화 항목(git, 배포, CLAUDE.md) 은 "직접 하지 말라" 규칙.
+- **이 CLAUDE.md**: 코드 변경 커밋 전에 관련 섹션(파일 구조, 줄 수, 환경변수, 테스트 수,
+  Telegram UX 등) 최신화.
 
 ## 현재 제거된 것 (재도입 금지)
 
-- `anthropic` Python SDK — 분류기가 더 이상 API 호출 안 함.
-- `ANTHROPIC_API_KEY` 서브프로세스 전달 — `executor/claude_exec.py` 에서 필터링.
+- `anthropic` Python SDK — 분류기가 API 호출하지 않음.
+- `ANTHROPIC_API_KEY` 서브프로세스 전달 — `claude_exec.py` 에서 필터링.
 - `network_mode: bridge` — `nas-agent-shared` 외부 네트워크로 이관.
-- `docker-compose.yml` 의 `environment:` 하드코딩 — `.env` 로 일원화.
+- `docker-compose.yml` `environment:` 하드코딩 — `.env` 일원화.
+- `SUB_AGENTS_ENABLED` 글로벌 환경변수 — 프로젝트별 `--agents` 로 전환.
+
+---
 
 ## 변경 이력
 
@@ -299,6 +374,6 @@ python3 -m venv .venv
 | 2026-04-16 | `e6abd94` | LangGraph 워크플로 + SQLite 레지스트리 + GitHub 연동 |
 | 2026-04-16 | `7776409` | 공유 MySQL (nas-mysql) + /new --db 프로비저닝 |
 | 2026-04-16 | `bd48f42` | 프로젝트별 CLAUDE.md 자동 생성/유지 규칙 |
-| 2026-04-17 | — | CLAUDE.md 전면 갱신, 자동 갱신 정책 명시 |
-| 2026-04-17 | — | Sub-agent 워크플로 (plan → code → review → fix). ephemeral CLI 세션 |
-| 2026-04-17 | — | Sub-agent 를 프로젝트별 설정으로 전환 (/new --agents, registry 저장) |
+| 2026-04-17 | `37a4867` | Sub-agent 워크플로 (plan → code → review → fix) |
+| 2026-04-17 | `3b59162` | Sub-agent 를 프로젝트별 설정으로 전환 (/new --agents) |
+| 2026-04-17 | — | CLAUDE.md 전면 재구성: 아키텍처 다이어그램, 노드 테이블, 줄 수 갱신 |
