@@ -71,10 +71,51 @@ async def create_repo(
         async with session.post(url, headers=headers, data=json.dumps(payload)) as resp:
             body = await resp.text()
             if resp.status == 422 and "name already exists" in body:
-                raise GitHubError(f"이미 존재하는 GitHub repo: {name}")
+                # 이미 존재하면 기존 repo 정보를 가져온다
+                existing = await get_repo(name, token, owner=owner, timeout=timeout)
+                if existing:
+                    return existing
+                raise GitHubError(f"이미 존재하는 GitHub repo 인데 정보를 가져올 수 없음: {name}")
             if resp.status not in (200, 201):
                 raise GitHubError(f"GitHub repo 생성 실패 ({resp.status}): {body[:300]}")
             data = json.loads(body)
+
+    return RepoInfo(
+        html_url=data["html_url"],
+        clone_url=data["clone_url"],
+        full_name=data["full_name"],
+    )
+
+
+async def get_repo(
+    name: str,
+    token: str,
+    *,
+    owner: Optional[str] = None,
+    timeout: int = 30,
+) -> Optional[RepoInfo]:
+    """기존 GitHub repo 정보를 가져온다. 없으면 None."""
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    # owner 가 없으면 토큰 소유자를 먼저 조회
+    if not owner:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            async with session.get(f"{GITHUB_API}/user", headers=headers) as resp:
+                if resp.status != 200:
+                    return None
+                user_data = json.loads(await resp.text())
+                owner = user_data["login"]
+
+    url = f"{GITHUB_API}/repos/{owner}/{name}"
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+        async with session.get(url, headers=headers) as resp:
+            if resp.status != 200:
+                return None
+            data = json.loads(await resp.text())
 
     return RepoInfo(
         html_url=data["html_url"],
@@ -177,6 +218,42 @@ async def ensure_git_initialized(
             return r
 
     return GitResult(True, "git initialized")
+
+
+async def clone_or_pull(
+    project_dir: str,
+    clone_url: str,
+    *,
+    token: str,
+    user_name: str = "NAS Agent",
+    user_email: str = "nas-agent@local",
+) -> GitResult:
+    """프로젝트 디렉터리에 기존 repo 를 clone. 이미 .git 이 있으면 pull."""
+    remote = _remote_with_token(clone_url, token)
+    git_dir = os.path.join(project_dir, ".git")
+
+    if os.path.isdir(git_dir):
+        # 이미 clone 되어 있으면 pull
+        r = await _run_git("remote", "set-url", "origin", remote, cwd=project_dir)
+        if not r.ok:
+            return r
+        r = await _run_git("pull", "--ff-only", "origin", "HEAD", cwd=project_dir, timeout=120)
+        return r
+
+    # 새로 clone
+    os.makedirs(project_dir, exist_ok=True)
+    # clone 은 빈 디렉터리에만 가능 — 임시로 상위 디렉터리에서 clone
+    parent = os.path.dirname(project_dir)
+    dir_name = os.path.basename(project_dir)
+    r = await _run_git("clone", remote, dir_name, cwd=parent, timeout=120)
+    if not r.ok:
+        return r
+
+    # git config
+    for key, val in (("user.name", user_name), ("user.email", user_email)):
+        await _run_git("config", key, val, cwd=project_dir)
+
+    return GitResult(True, "clone 완료")
 
 
 _NOTHING_TO_COMMIT = re.compile(r"nothing to commit", re.IGNORECASE)

@@ -261,11 +261,11 @@ def build_workflow(
         }
 
     async def github_init(state: WorkflowState) -> dict:
-        """새 프로젝트일 때만 GitHub repo 를 만든다."""
+        """새 프로젝트일 때 GitHub repo 를 만들거나, 이미 있으면 clone 한다."""
         if not state["is_new"] or not gh_cfg.enabled:
             return {}
         project: Project = state["project"]
-        logger.info(f"[github_init] '{project.name}' repo 생성 중…")
+        logger.info(f"[github_init] '{project.name}' repo 확인/생성 중…")
         try:
             repo: RepoInfo = await github_exec.create_repo(
                 project.name,
@@ -275,12 +275,27 @@ def build_workflow(
                 owner=gh_cfg.owner or None,
             )
         except GitHubError as e:
-            logger.warning(f"github_init 실패: {e}")
+            logger.warning(f"[github_init] 실패: {e}")
             return {"github_output": f"GitHub repo 생성 실패: {e}"}
 
         await registry.set_repo_url(project.name, repo.html_url)
+
+        # 기존 repo 면 clone 해서 프로젝트 디렉터리에 코드를 가져온다
+        project_dir = os.path.join(state["projects_dir"], project.name)
+        clone_result = await github_exec.clone_or_pull(
+            project_dir,
+            repo.clone_url,
+            token=gh_cfg.token,
+            user_name=gh_cfg.user_name,
+            user_email=gh_cfg.user_email,
+        )
+        if clone_result.ok:
+            logger.info(f"[github_init] '{project.name}' {clone_result.output}")
+        else:
+            logger.warning(f"[github_init] '{project.name}' clone/pull 실패: {clone_result.output}")
+
         refreshed = await registry.get(project.name)
-        logger.info(f"[github_init] '{project.name}' repo 생성 완료: {repo.html_url}")
+        logger.info(f"[github_init] '{project.name}' repo: {repo.html_url}")
         return {"project": refreshed, "github_output": f"GitHub repo: {repo.html_url}"}
 
     async def provision_db(state: WorkflowState) -> dict:

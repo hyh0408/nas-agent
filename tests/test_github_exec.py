@@ -30,12 +30,21 @@ class _FakeResponse:
 
 
 class _FakeSession:
-    def __init__(self, response):
+    def __init__(self, response, get_response=None):
         self._response = response
+        self._get_response = get_response or response
         self.calls = []
 
     def post(self, url, headers=None, data=None):
-        self.calls.append({"url": url, "headers": headers, "data": data})
+        self.calls.append({"method": "post", "url": url, "headers": headers, "data": data})
+        return self._response
+
+    def get(self, url, headers=None):
+        self.calls.append({"method": "get", "url": url, "headers": headers})
+        return self._get_response
+
+    def delete(self, url, headers=None):
+        self.calls.append({"method": "delete", "url": url, "headers": headers})
         return self._response
 
     async def __aenter__(self):
@@ -77,11 +86,32 @@ async def test_create_repo_for_org_hits_org_endpoint():
     assert session.calls[0]["url"].endswith("/orgs/acme/repos")
 
 
-async def test_create_repo_surfaces_conflict():
-    session = _FakeSession(_FakeResponse(422, '{"errors":[{"message":"name already exists"}]}'))
-    with patch.object(github_exec.aiohttp, "ClientSession", return_value=session):
-        with pytest.raises(github_exec.GitHubError, match="이미 존재"):
-            await github_exec.create_repo("dup", "desc", "tok")
+async def test_create_repo_existing_returns_info_via_get():
+    """이미 존재하는 repo 면 get_repo 로 fallback 해서 정보를 돌려준다."""
+    conflict_resp = _FakeResponse(422, '{"errors":[{"message":"name already exists"}]}')
+    repo_resp = _FakeResponse(200, json.dumps({
+        "html_url": "https://github.com/acme/dup",
+        "clone_url": "https://github.com/acme/dup.git",
+        "full_name": "acme/dup",
+    }))
+
+    # owner 를 명시하면 get_repo 가 /user 를 호출하지 않아 mock 이 단순해짐
+    sessions = [
+        _FakeSession(conflict_resp),             # create → 422
+        _FakeSession(None, get_response=repo_resp),  # get /repos/acme/dup
+    ]
+    idx = {"i": 0}
+
+    def fake_session(**kwargs):
+        s = sessions[min(idx["i"], len(sessions) - 1)]
+        idx["i"] += 1
+        return s
+
+    with patch.object(github_exec.aiohttp, "ClientSession", side_effect=fake_session):
+        repo = await github_exec.create_repo("dup", "desc", "tok", owner="acme")
+
+    assert repo.full_name == "acme/dup"
+    assert repo.html_url == "https://github.com/acme/dup"
 
 
 async def test_create_repo_other_failures_raise():

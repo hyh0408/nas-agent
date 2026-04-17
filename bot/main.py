@@ -337,16 +337,9 @@ async def cmd_rm(update: Update, context):
             results.append(f"MySQL 삭제 실패: {e}")
             logger.error(f"[rm] '{name}' MySQL 삭제 실패: {e}")
 
-    # 2. GitHub repo 삭제
-    if project.repo_url and Config.GITHUB_TOKEN:
-        try:
-            from executor import github_exec
-            await github_exec.delete_repo(project.repo_url, Config.GITHUB_TOKEN)
-            results.append(f"GitHub repo 삭제됨")
-            logger.info(f"[rm] '{name}' GitHub repo 삭제 완료: {project.repo_url}")
-        except Exception as e:
-            results.append(f"GitHub 삭제 실패: {e}")
-            logger.error(f"[rm] '{name}' GitHub 삭제 실패: {e}")
+    # 2. GitHub repo 는 보존 (다음 /new 에서 재사용)
+    if project.repo_url:
+        results.append(f"GitHub repo 보존됨: {project.repo_url}")
 
     # 3. 로컬 프로젝트 파일 삭제
     import shutil
