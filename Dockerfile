@@ -23,13 +23,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY bot/ ./bot/
 COPY executor/ ./executor/
 
-# non-root 사용자 생성
-# Synology 의 docker.sock 은 root:root(0:0) 소유이므로 root 그룹에 추가
-RUN groupadd -r agent \
-    && useradd -r -g agent -m -d /home/agent agent \
-    && usermod -aG root agent
+# gosu 로 root → non-root 전환
+RUN apt-get update && apt-get install -y --no-install-recommends gosu && rm -rf /var/lib/apt/lists/*
+
+# non-root 사용자 생성 (Claude CLI 가 root 에서 --dangerously-skip-permissions 차단)
+RUN groupadd -r agent && useradd -r -g agent -m -d /home/agent agent
+
+COPY entrypoint.sh /entrypoint.sh
 
 EXPOSE 9100
 
-USER agent
-CMD ["python", "-m", "bot.main"]
+# root 로 시작 → entrypoint 에서 소켓 권한 조정 후 agent 로 전환
+ENTRYPOINT ["/entrypoint.sh"]
