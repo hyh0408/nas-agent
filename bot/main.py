@@ -116,9 +116,9 @@ async def _run_workflow_and_reply(
         if sub_agents:
             parts.append("sub-agents")
         extras = f" (+{', '.join(parts)})" if parts else ""
-        await update.message.reply_text(
-            f"🔨 '{project_name}' {action_label}{extras} 시작. 완료까지 몇 분 걸릴 수 있습니다."
-        )
+        msg = f"🔨 '{project_name}' {action_label}{extras} 시작. 완료까지 몇 분 걸릴 수 있습니다."
+        logger.info(f"[workflow] {msg}")
+        await update.message.reply_text(msg)
         try:
             state = await workflow.ainvoke({
                 "project_name": project_name,
@@ -130,11 +130,15 @@ async def _run_workflow_and_reply(
                 "projects_dir": Config.PROJECTS_DIR,
             })
         except Exception as e:
-            logger.exception("workflow crashed")
+            logger.exception(f"[workflow] '{project_name}' 크래시")
             await update.message.reply_text(f"워크플로 오류: {e}")
             return
 
-    await update.message.reply_text(format_workflow_result(state))
+    result_text = format_workflow_result(state)
+    logger.info(f"[workflow] '{project_name}' 완료 — status={state.get('status')} deployed={state.get('deployed')}")
+    if state.get("error"):
+        logger.error(f"[workflow] '{project_name}' 에러: {state['error']}")
+    await update.message.reply_text(result_text)
 
 
 # ── 명령 핸들러 ──────────────────────────────────────────────
@@ -200,6 +204,7 @@ async def cmd_restart(update: Update, context):
 
 @authorized
 async def cmd_new(update: Update, context):
+    logger.info(f"[cmd] /new args={context.args} from={update.effective_user.id}")
     if len(context.args) < 2:
         await update.message.reply_text(
             "사용법: /new <이름> [--db] [--agents] <설명>\n"
@@ -240,6 +245,7 @@ async def cmd_new(update: Update, context):
 
 @authorized
 async def cmd_work(update: Update, context):
+    logger.info(f"[cmd] /work args={context.args} from={update.effective_user.id}")
     if len(context.args) < 2:
         await update.message.reply_text("사용법: /work <이름> <작업 내용>")
         return
@@ -302,6 +308,7 @@ async def cmd_projects(update: Update, context):
 
 @authorized
 async def cmd_rm(update: Update, context):
+    logger.info(f"[cmd] /rm args={context.args} from={update.effective_user.id}")
     if not context.args:
         await update.message.reply_text("사용법: /rm <프로젝트이름> [--drop-db]")
         return
@@ -327,9 +334,9 @@ async def cmd_rm(update: Update, context):
             db_msg = f"\nMySQL 삭제 실패: {e}"
 
     await registry.delete(name)
-    await update.message.reply_text(
-        f"'{name}' 제거됨\n(프로젝트 파일은 그대로 남아 있습니다)" + db_msg
-    )
+    result_msg = f"'{name}' 제거됨\n(프로젝트 파일은 그대로 남아 있습니다)" + db_msg
+    logger.info(f"[cmd] /rm '{name}' 완료{db_msg}")
+    await update.message.reply_text(result_msg)
 
 
 # ── 자연어 메시지 핸들러 ─────────────────────────────────────

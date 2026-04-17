@@ -230,25 +230,30 @@ def build_workflow(
 
     async def load(state: WorkflowState) -> dict:
         name = state["project_name"]
+        logger.info(f"[load] '{name}' is_new={state['is_new']}")
         try:
             existing = await registry.get(name)
             if state["is_new"]:
                 if existing:
+                    logger.warning(f"[load] '{name}' 이미 존재")
                     return {"error": f"이미 존재하는 프로젝트: {name}", "status": "error"}
                 use_agents = state.get("sub_agents", False)
                 project = await registry.create(
                     name, state.get("description", ""), sub_agents=use_agents
                 )
+                logger.info(f"[load] '{name}' 생성 완료 session={project.session_id[:8]}…")
             else:
                 if not existing:
+                    logger.warning(f"[load] '{name}' 찾을 수 없음")
                     return {
                         "error": f"프로젝트를 찾을 수 없습니다: {name}",
                         "status": "error",
                     }
                 project = existing
+                logger.info(f"[load] '{name}' 로드 완료 session={project.session_id[:8]}…")
         except ProjectError as e:
+            logger.error(f"[load] '{name}' 오류: {e}")
             return {"error": str(e), "status": "error"}
-        # 이어작업 시 프로젝트에 저장된 sub_agents 설정을 state 에 반영
         return {
             "project": project,
             "sub_agents": project.sub_agents,
@@ -260,6 +265,7 @@ def build_workflow(
         if not state["is_new"] or not gh_cfg.enabled:
             return {}
         project: Project = state["project"]
+        logger.info(f"[github_init] '{project.name}' repo 생성 중…")
         try:
             repo: RepoInfo = await github_exec.create_repo(
                 project.name,
@@ -274,6 +280,7 @@ def build_workflow(
 
         await registry.set_repo_url(project.name, repo.html_url)
         refreshed = await registry.get(project.name)
+        logger.info(f"[github_init] '{project.name}' repo 생성 완료: {repo.html_url}")
         return {"project": refreshed, "github_output": f"GitHub repo: {repo.html_url}"}
 
     async def provision_db(state: WorkflowState) -> dict:
@@ -348,12 +355,14 @@ def build_workflow(
                 name=project.name, task=state["task"], db_section=db_section,
             )
 
+        logger.info(f"[plan] '{project.name}' planner 실행 중… (timeout={sa_cfg.plan_timeout}s)")
         result = await run_claude(
             prompt, cwd=project_dir, ephemeral=True, timeout=sa_cfg.plan_timeout,
         )
         if result.is_error:
-            logger.warning(f"planner 실패: {result.text[:200]}")
-            return {"plan_output": ""}  # 계획 실패해도 코딩은 진행
+            logger.warning(f"[plan] '{project.name}' planner 실패: {result.text[:200]}")
+            return {"plan_output": ""}
+        logger.info(f"[plan] '{project.name}' planner 완료 ({len(result.text)}자)")
         return {"plan_output": result.text}
 
     async def code(state: WorkflowState) -> dict:
@@ -386,12 +395,17 @@ def build_workflow(
             ) + plan_section
             resume = True
 
+        logger.info(f"[code] '{project.name}' coder 실행 중… resume={resume} session={project.session_id[:8]}…")
         result = await run_claude(
             prompt,
             cwd=project_dir,
             session_id=project.session_id,
             resume=resume,
         )
+        if result.is_error:
+            logger.error(f"[code] '{project.name}' coder 실패: {result.text[:300]}")
+        else:
+            logger.info(f"[code] '{project.name}' coder 완료 ({len(result.text)}자)")
         return {
             "cli_result": result,
             "status": "cli_error" if result.is_error else "coded",
@@ -409,15 +423,17 @@ def build_workflow(
         project_dir = os.path.join(state["projects_dir"], project.name)
 
         prompt = REVIEW_PROMPT.format(name=project.name)
+        logger.info(f"[review] '{project.name}' reviewer 실행 중…")
         result = await run_claude(
             prompt, cwd=project_dir, ephemeral=True, timeout=sa_cfg.review_timeout,
         )
         if result.is_error:
-            logger.warning(f"reviewer 실패: {result.text[:200]}")
+            logger.warning(f"[review] '{project.name}' reviewer 실패: {result.text[:200]}")
             return {"review_passed": True, "review_output": ""}
 
         text = result.text.strip()
         passed = text.upper().startswith("LGTM")
+        logger.info(f"[review] '{project.name}' 결과={'LGTM' if passed else 'ISSUES'}")
         return {"review_output": text, "review_passed": passed}
 
     async def fix(state: WorkflowState) -> dict:
@@ -428,6 +444,7 @@ def build_workflow(
         project: Project = state["project"]
         project_dir = os.path.join(state["projects_dir"], project.name)
 
+        logger.info(f"[fix] '{project.name}' fixer 실행 중…")
         prompt = FIX_PROMPT.format(
             name=project.name,
             review_output=state.get("review_output", ""),
@@ -439,27 +456,33 @@ def build_workflow(
             resume=True,
             timeout=sa_cfg.fix_timeout,
         )
+        if result.is_error:
+            logger.error(f"[fix] '{project.name}' fixer 실패: {result.text[:200]}")
+        else:
+            logger.info(f"[fix] '{project.name}' fixer 완료")
         return {
             "fix_result": result,
             "status": "fix_error" if result.is_error else "fixed",
         }
 
     async def deploy(state: WorkflowState) -> dict:
-        # 코딩·수정 결과 중 최종 성공 여부 판단
         cli = state.get("fix_result") or state.get("cli_result")
         if cli is None or cli.is_error:
+            logger.info(f"[deploy] '{state.get('project_name', '?')}' CLI 오류로 배포 건너뜀")
             return {"deployed": False, "deploy_output": "CLI 오류로 배포 건너뜀"}
 
         project: Project = state["project"]
         project_dir = os.path.join(state["projects_dir"], project.name)
         compose = os.path.join(project_dir, "docker-compose.yml")
         if not os.path.isfile(compose):
+            logger.info(f"[deploy] '{project.name}' docker-compose.yml 없음 — 스킵")
             return {
                 "deployed": False,
                 "deploy_output": "docker-compose.yml 없음 — 배포 건너뜀",
                 "status": "no_compose",
             }
 
+        logger.info(f"[deploy] '{project.name}' docker compose up -d --build 실행 중…")
         proc = await asyncio.create_subprocess_exec(
             "docker", "compose",
             "-f", compose,
@@ -474,6 +497,7 @@ def build_workflow(
             )
         except asyncio.TimeoutError:
             proc.kill()
+            logger.error(f"[deploy] '{project.name}' 시간 초과 ({deploy_timeout}s)")
             return {
                 "deployed": False,
                 "deploy_output": f"배포 시간 초과 ({deploy_timeout}s)",
@@ -482,6 +506,10 @@ def build_workflow(
 
         output = (stdout + b"\n" + stderr).decode(errors="replace").strip()
         deployed = proc.returncode == 0
+        if deployed:
+            logger.info(f"[deploy] '{project.name}' 배포 성공")
+        else:
+            logger.error(f"[deploy] '{project.name}' 배포 실패 (exit {proc.returncode}): {output[:300]}")
         return {
             "deployed": deployed,
             "deploy_output": output,
@@ -497,7 +525,9 @@ def build_workflow(
             return {}
         cli = state.get("cli_result")
         if cli is None or cli.is_error:
+            logger.info(f"[github_sync] CLI 오류로 push 스킵")
             return {"github_output": (state.get("github_output") or "") + " | CLI 오류로 push 스킵"}
+        logger.info(f"[github_sync] '{project.name}' commit + push 중…")
 
         project_dir = os.path.join(state["projects_dir"], project.name)
         clone_url = _to_clone_url(project.repo_url)
