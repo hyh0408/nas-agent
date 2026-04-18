@@ -7,6 +7,11 @@ RUN apt-get update && \
     # Docker CLI 바이너리 직접 다운로드
     curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.4.1.tgz | \
     tar xz --strip-components=1 -C /usr/local/bin docker/docker && \
+    # Docker Compose 플러그인 설치
+    mkdir -p /usr/local/lib/docker/cli-plugins && \
+    curl -fsSL https://github.com/docker/compose/releases/download/v2.32.4/docker-compose-linux-x86_64 \
+    -o /usr/local/lib/docker/cli-plugins/docker-compose && \
+    chmod +x /usr/local/lib/docker/cli-plugins/docker-compose && \
     # Node.js 20 설치 (Claude Code CLI 필수)
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
     apt-get install -y nodejs && \
