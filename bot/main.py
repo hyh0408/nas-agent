@@ -51,6 +51,8 @@ registry: ProjectRegistry | None = None
 workflow = None
 # 같은 프로젝트에 동시 작업 요청이 오면 CLI 세션이 충돌할 수 있으니 직렬화.
 _project_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+# 유저별 현재 작업 중인 프로젝트 (in-memory, 재시작 시 초기화)
+_current_project: dict[int, str] = {}
 
 
 def _init_state() -> None:
@@ -99,7 +101,6 @@ async def _run_workflow_and_reply(
     is_new: bool,
     task: str = "",
     description: str = "",
-    db_required: bool = False,
     sub_agents: bool = False,
 ):
     lock = _project_locks[project_name]
@@ -112,8 +113,6 @@ async def _run_workflow_and_reply(
     async with lock:
         action_label = "생성" if is_new else "작업"
         parts = []
-        if is_new and db_required:
-            parts.append("MySQL DB")
         if sub_agents:
             parts.append("sub-agents")
         extras = f" (+{', '.join(parts)})" if parts else ""
@@ -126,7 +125,6 @@ async def _run_workflow_and_reply(
                 "task": task,
                 "is_new": is_new,
                 "description": description,
-                "db_required": db_required,
                 "sub_agents": sub_agents,
                 "projects_dir": Config.PROJECTS_DIR,
             })
@@ -134,6 +132,12 @@ async def _run_workflow_and_reply(
             logger.exception(f"[workflow] '{project_name}' 크래시")
             await update.message.reply_text(f"워크플로 오류: {e}")
             return
+
+    # 성공 시 현재 프로젝트로 설정
+    user_id = update.effective_user.id
+    if not state.get("error"):
+        _current_project[user_id] = project_name
+        logger.info(f"[context] user={user_id} 현재 프로젝트 → '{project_name}'")
 
     result_text = format_workflow_result(state)
     logger.info(f"[workflow] '{project_name}' 완료 — status={state.get('status')} deployed={state.get('deployed')}")
@@ -149,11 +153,14 @@ async def cmd_start(update: Update, context):
     await update.message.reply_text(
         "NAS Agent Bot\n\n"
         "── 프로젝트 ─────────────\n"
-        "/new <이름> [--db] [--agents] <설명>  - 새 프로젝트 (--db: MySQL, --agents: 리뷰)\n"
-        "/work <이름> <작업>       - 기존 프로젝트 이어서 개발 + 재배포\n"
-        "/info <이름>              - 프로젝트 상태·히스토리\n"
-        "/projects                 - 프로젝트 목록\n"
-        "/rm <이름> [--drop-db]    - 레지스트리 제거 (--drop-db: DB 도 삭제)\n\n"
+        "/new <이름> [--agents] <설명>  - 새 프로젝트 (DB 자동)\n"
+        "/work <이름> <작업>       - 이어서 개발\n"
+        "/use <이름>               - 현재 프로젝트 전환\n"
+        "/current                  - 현재 프로젝트 확인\n"
+        "/info <이름>              - 프로젝트 상태\n"
+        "/projects                 - 목록\n"
+        "/rm <이름>                - 제거\n\n"
+        "💡 /new 또는 /use 후에는 프로젝트 이름 없이 메시지만 보내도 됩니다.\n\n"
         "── 컨테이너 ─────────────\n"
         "/sys                    - NAS 리소스 상태\n"
         "/status                 - 컨테이너 상태\n"
@@ -208,23 +215,20 @@ async def cmd_new(update: Update, context):
     logger.info(f"[cmd] /new args={context.args} from={update.effective_user.id}")
     if len(context.args) < 2:
         await update.message.reply_text(
-            "사용법: /new <이름> [--db] [--agents] <설명>\n"
-            "  --db      MySQL database 자동 생성\n"
-            "  --agents  plan→code→review→fix sub-agent 활성"
+            "사용법: /new <이름> [--agents] <설명>\n"
+            "  --agents  plan→code→review→fix sub-agent 활성\n"
+            "  DB 는 MariaDB 설정 시 자동 프로비저닝됩니다."
         )
         return
     name = context.args[0].lower()
     rest = list(context.args[1:])
-    db_required = False
     use_agents = False
-    # 플래그 파싱 (순서 무관)
-    flags = {"--db", "--agents"}
-    while rest and rest[0] in flags:
+    # 플래그 파싱
+    while rest and rest[0] in {"--agents", "--db"}:
         flag = rest.pop(0)
-        if flag == "--db":
-            db_required = True
-        elif flag == "--agents":
+        if flag == "--agents":
             use_agents = True
+        # --db 는 하위 호환으로 받되 무시 (자동 프로비저닝)
     if not rest:
         await update.message.reply_text("설명이 비어 있습니다.")
         return
@@ -239,7 +243,6 @@ async def cmd_new(update: Update, context):
         project_name=name,
         is_new=True,
         description=description,
-        db_required=db_required,
         sub_agents=use_agents,
     )
 
@@ -362,6 +365,42 @@ async def cmd_rm(update: Update, context):
     await update.message.reply_text(result_msg)
 
 
+@authorized
+async def cmd_use(update: Update, context):
+    user_id = update.effective_user.id
+    if not context.args:
+        await update.message.reply_text("사용법: /use <프로젝트이름>")
+        return
+    name = context.args[0].lower()
+    project = await registry.get(name)
+    if not project:
+        await update.message.reply_text(f"프로젝트를 찾을 수 없음: {name}")
+        return
+    _current_project[user_id] = name
+    logger.info(f"[context] user={user_id} 현재 프로젝트 → '{name}'")
+    agents = " (agents)" if project.sub_agents else ""
+    await update.message.reply_text(
+        f"🔀 현재 프로젝트: {name}{agents}\n"
+        f"이제 메시지를 보내면 '{name}' 에 대한 작업으로 처리됩니다."
+    )
+
+
+@authorized
+async def cmd_current(update: Update, context):
+    user_id = update.effective_user.id
+    name = _current_project.get(user_id)
+    if not name:
+        await update.message.reply_text("현재 선택된 프로젝트가 없습니다. /use <이름> 으로 지정하세요.")
+        return
+    project = await registry.get(name)
+    if not project:
+        del _current_project[user_id]
+        await update.message.reply_text("이전에 선택한 프로젝트가 삭제되었습니다. /use <이름> 으로 다시 지정하세요.")
+        return
+    agents = " (agents)" if project.sub_agents else ""
+    await update.message.reply_text(f"📌 현재 프로젝트: {name}{agents}")
+
+
 # ── 자연어 메시지 핸들러 ─────────────────────────────────────
 
 @authorized
@@ -387,7 +426,6 @@ async def handle_message(update: Update, context):
                 project_name=classified["name"],
                 is_new=True,
                 description=classified["description"],
-                db_required=bool(classified.get("db_required")),
             )
         else:
             proj = await registry.get(classified["name"])
@@ -405,11 +443,26 @@ async def handle_message(update: Update, context):
         return
 
     if msg_type == "complex":
-        # 프로젝트 컨텍스트 없는 단발성 요청은 안내만 하고 CLI 를 돌리지 않는다.
-        # (예전에는 /app/projects 루트에서 돌렸지만 세션 관리가 안 됨)
+        # 현재 프로젝트가 있으면 해당 프로젝트에 대한 작업으로 처리
+        user_id = update.effective_user.id
+        current = _current_project.get(user_id)
+        if current:
+            proj = await registry.get(current)
+            if proj:
+                logger.info(f"[context] 현재 프로젝트 '{current}' 로 라우팅: {text[:50]}")
+                await _run_workflow_and_reply(
+                    update,
+                    project_name=current,
+                    is_new=False,
+                    task=classified["description"],
+                    sub_agents=proj.sub_agents,
+                )
+                return
         await update.message.reply_text(
-            "프로젝트 단위로 작업하려면 /new 또는 /work 를 사용해 주세요.\n"
-            "예: `/new myapi FastAPI 로 할일 API 만들어줘`"
+            "현재 선택된 프로젝트가 없습니다.\n"
+            "• /new <이름> <설명> — 새 프로젝트\n"
+            "• /use <이름> — 기존 프로젝트 선택\n"
+            "• /projects — 목록 보기"
         )
         return
 
@@ -469,6 +522,8 @@ def main():
     # project
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("work", cmd_work))
+    app.add_handler(CommandHandler("use", cmd_use))
+    app.add_handler(CommandHandler("current", cmd_current))
     app.add_handler(CommandHandler("info", cmd_info))
     app.add_handler(CommandHandler("projects", cmd_projects))
     app.add_handler(CommandHandler("rm", cmd_rm))

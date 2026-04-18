@@ -78,7 +78,6 @@ class WorkflowState(TypedDict, total=False):
     is_new: bool
     description: str
     projects_dir: str
-    db_required: bool      # /new --db 또는 자연어 DB 키워드
     sub_agents: bool       # 프로젝트별 sub-agent 사용 여부
 
     # 중간 / 출력
@@ -201,17 +200,20 @@ def _db_prompt_section(creds: Optional[DBCredentials]) -> str:
     if creds is None:
         return ""
     return (
-        "\n사용 가능한 MySQL 데이터베이스 (Synology NAS MariaDB):\n"
+        "\n사용 가능한 MySQL/MariaDB (NAS 호스트에서 운영 중):\n"
         f"  HOST: {creds.host}\n"
         f"  PORT: {creds.port}\n"
         f"  DATABASE: {creds.database}\n"
         f"  USER: {creds.user}\n"
         f"  PASSWORD: {creds.password}\n\n"
-        f"docker-compose.yml 규칙:\n"
+        f"DB 관련 필수 규칙:\n"
+        f"- 위 MariaDB 만 사용하세요. PostgreSQL, SQLite, MongoDB 등 다른 DB 를 설치하거나\n"
+        f"  docker-compose 에 DB 서비스를 추가하지 마세요.\n"
         f"- 앱 서비스 environment 에 MYSQL_HOST / MYSQL_PORT / MYSQL_DATABASE /\n"
-        f"  MYSQL_USER / MYSQL_PASSWORD 를 위 값 그대로 주입\n"
-        f"- MySQL 서비스를 프로젝트에 따로 띄우지 말 것 (NAS 호스트 MariaDB 재사용)\n"
-        f"- network_mode: bridge 또는 extra_hosts 로 NAS 호스트에 접근 가능하게 설정\n"
+        f"  MYSQL_USER / MYSQL_PASSWORD 를 위 값 그대로 주입하세요.\n"
+        f"- ORM 을 쓸 때는 MySQL/MariaDB 호환 드라이버를 사용하세요\n"
+        f"  (예: pymysql, mysqlclient, aiomysql).\n"
+        f"- network_mode: bridge 로 NAS 호스트에 접근 가능하게 설정\n"
     )
 
 
@@ -299,41 +301,14 @@ def build_workflow(
         return {"project": refreshed, "github_output": f"GitHub repo: {repo.html_url}"}
 
     async def provision_db(state: WorkflowState) -> dict:
-        """새 프로젝트면서 db_required 면 MySQL 에 database+user 를 만든다.
-        기존 프로젝트면 레지스트리에 저장된 자격증명을 state 에 올린다."""
+        """MySQL 이 설정되어 있으면 자동 프로비저닝. --db 플래그 불필요.
+        새 프로젝트: DB 자동 생성. 기존 프로젝트: 저장된 자격증명 로드,
+        없으면 소급 생성."""
         project: Optional[Project] = state.get("project")
-        if project is None:
+        if project is None or not my_cfg.enabled:
             return {}
 
-        if state["is_new"]:
-            if not state.get("db_required"):
-                return {}
-            if not my_cfg.enabled:
-                return {
-                    "error": "MySQL 이 설정되지 않았습니다 (MYSQL_ROOT_PASSWORD 필요)",
-                    "status": "error",
-                }
-            try:
-                creds = await mysql_exec.provision(
-                    project.name,
-                    root_password=my_cfg.root_password,
-                    host=my_cfg.host,
-                    port=my_cfg.port,
-                )
-            except MySQLError as e:
-                return {"error": f"DB 프로비저닝 실패: {e}", "status": "error"}
-
-            await registry.set_db_info(
-                project.name, creds.database, creds.user, creds.password
-            )
-            refreshed = await registry.get(project.name)
-            return {
-                "project": refreshed,
-                "db_credentials": creds,
-                "db_output": f"DB 생성: {creds.database} / user {creds.user}",
-            }
-
-        # 계속 작업: 이미 저장된 DB 가 있으면 state 에 실어준다
+        # 이미 DB 가 있으면 자격증명만 state 에 올린다
         if project.db_name and project.db_user and project.db_password:
             creds = DBCredentials(
                 host=my_cfg.host,
@@ -343,7 +318,29 @@ def build_workflow(
                 password=project.db_password,
             )
             return {"db_credentials": creds}
-        return {}
+
+        # DB 가 없으면 프로비저닝 (새 프로젝트 or 기존 프로젝트 소급)
+        try:
+            creds = await mysql_exec.provision(
+                project.name,
+                root_password=my_cfg.root_password,
+                host=my_cfg.host,
+                port=my_cfg.port,
+            )
+        except MySQLError as e:
+            logger.warning(f"[provision_db] '{project.name}' 프로비저닝 실패: {e}")
+            return {}  # DB 실패해도 프로젝트 생성은 계속 진행
+
+        await registry.set_db_info(
+            project.name, creds.database, creds.user, creds.password
+        )
+        refreshed = await registry.get(project.name)
+        logger.info(f"[provision_db] '{project.name}' DB 생성: {creds.database}")
+        return {
+            "project": refreshed,
+            "db_credentials": creds,
+            "db_output": f"DB 생성: {creds.database} / user {creds.user}",
+        }
 
     def _agents_on(state: WorkflowState) -> bool:
         return bool(state.get("sub_agents", False))

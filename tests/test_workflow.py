@@ -451,7 +451,6 @@ async def test_new_project_with_db_provisions_and_feeds_prompt(registry, project
             "task": "",
             "is_new": True,
             "description": "블로그",
-            "db_required": True,
             "projects_dir": projects_dir,
         })
 
@@ -469,23 +468,25 @@ async def test_new_project_with_db_provisions_and_feeds_prompt(registry, project
     assert state["db_credentials"].database == "proj_myapp"
 
 
-async def test_db_required_without_mysql_config_errors(registry, projects_dir):
+async def test_mysql_not_configured_skips_provisioning(registry, projects_dir):
+    """MySQL 미설정 시 DB 프로비저닝을 건너뛰고 프로젝트 생성은 계속 진행."""
     graph = wf.build_workflow(registry, wf.GitHubConfig(), wf.MySQLConfig(root_password=""))
+    _setup_compose(projects_dir, "myapp")
 
-    async def must_not_call(*a, **k):
-        raise AssertionError("CLI 호출되면 안 됨")
+    async def fake_claude(*a, **k):
+        return ClaudeResult(session_id="s", text="ok", is_error=False, raw={})
 
-    with patch.object(wf, "run_claude", side_effect=must_not_call):
+    with patch.object(wf, "run_claude", side_effect=fake_claude), _patch_docker():
         state = await graph.ainvoke({
             "project_name": "myapp",
             "task": "",
             "is_new": True,
             "description": "x",
-            "db_required": True,
             "projects_dir": projects_dir,
         })
 
-    assert "MySQL" in state.get("error", "")
+    assert state.get("db_credentials") is None
+    assert state["deployed"] is True
 
 
 async def test_continue_project_reloads_existing_db_credentials(registry, projects_dir):
@@ -517,7 +518,6 @@ async def test_continue_project_reloads_existing_db_credentials(registry, projec
             "task": "추가 기능",
             "is_new": False,
             "description": "",
-            "db_required": False,  # continue 에서는 기존 DB 가 있으면 자동으로 실림
             "projects_dir": projects_dir,
         })
 
