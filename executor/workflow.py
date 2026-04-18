@@ -118,6 +118,27 @@ CLAUDE_MD_RULES_CONTINUE = (
 )
 
 
+HARNESS_RULES_NEW = (
+    "- `.claude/agents/` 와 `.claude/skills/orchestrator/` 디렉터리를 **반드시** 생성하고\n"
+    "  이 프로젝트에 맞는 에이전트 팀을 구성:\n"
+    "    - `.claude/agents/architect.md` — 설계 담당. 프로젝트 구조·모듈 설계 결정.\n"
+    "    - `.claude/agents/coder.md` — 코드 구현 담당. 프로덕션 코드 작성/수정.\n"
+    "    - `.claude/agents/tester.md` — 테스트 작성·실행 담당.\n"
+    "    - `.claude/agents/reviewer.md` — 코드 리뷰·보안 점검 담당.\n"
+    "    - 프로젝트 특성에 따라 추가 에이전트 자유 정의 (예: data-collector, scheduler 등)\n"
+    "    - 각 에이전트 파일에는 YAML frontmatter(name, model: opus, description) +\n"
+    "      핵심 역할, 작업 원칙, 입출력 프로토콜, 팀 통신 프로토콜 포함\n"
+    "    - `.claude/skills/orchestrator/SKILL.md` — 에이전트 간 워크플로 조율.\n"
+    "      YAML frontmatter(name, description) + 워크플로 순서 + 팀 구성 테이블 포함\n"
+)
+
+HARNESS_RULES_CONTINUE = (
+    "- `.claude/agents/` 와 `.claude/skills/` 가 없으면 위 규칙대로 새로 생성.\n"
+    "  이미 있으면 이번 변경에 영향받는 에이전트/스킬만 업데이트.\n"
+    "  새 모듈이 추가되면 관련 에이전트의 전문 영역 섹션에 반영.\n"
+)
+
+
 NEW_PROJECT_PROMPT = (
     "새 프로젝트 '{name}' 를 현재 디렉터리에 스캐폴딩합니다.\n"
     "설명: {description}\n"
@@ -130,6 +151,7 @@ NEW_PROJECT_PROMPT = (
     "- 작업이 끝나면 자동으로 docker compose 로 배포되므로 즉시 실행 가능한 상태여야 함\n"
     "- git 작업(add/commit/push) 은 자동 처리되므로 직접 실행하지 마세요\n"
     "{claude_md_rules}"
+    "{harness_rules}"
     "- 마지막에 한국어로 변경 내역을 3~5줄로 요약"
 )
 
@@ -144,6 +166,7 @@ CONTINUE_PROJECT_PROMPT = (
     "- 작업이 끝나면 자동으로 재배포되므로 즉시 실행 가능한 상태여야 함\n"
     "- git 작업(add/commit/push) 은 자동 처리되므로 직접 실행하지 마세요\n"
     "{claude_md_rules}"
+    "{harness_rules}"
     "- 마지막에 한국어로 변경 내역을 3~5줄로 요약"
 )
 
@@ -396,6 +419,7 @@ def build_workflow(
                 description=state.get("description", ""),
                 db_section=db_section,
                 claude_md_rules=CLAUDE_MD_RULES_NEW,
+                harness_rules=HARNESS_RULES_NEW,
             ) + plan_section
             resume = False
         else:
@@ -404,6 +428,7 @@ def build_workflow(
                 task=state["task"],
                 db_section=db_section,
                 claude_md_rules=CLAUDE_MD_RULES_CONTINUE,
+                harness_rules=HARNESS_RULES_CONTINUE,
             ) + plan_section
             resume = True
 
