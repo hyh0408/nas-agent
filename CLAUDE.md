@@ -20,6 +20,20 @@
 - **Sub-agent**: 프로젝트별로 plan → code → review → fix 4단계 품질 워크플로 (선택)
 - **프로젝트별 CLAUDE.md**: 워크플로가 각 프로젝트에 요구사항 기반 문서를 자동 생성/유지
 
+## 하네스 (에이전트 팀)
+
+멀티 에이전트 협업이 필요한 작업에서 `.claude/skills/orchestrator/` 스킬이 트리거된다.
+
+| 에이전트 | 역할 |
+|----------|------|
+| architect | 설계, CLAUDE.md 유지 |
+| coder | 코드 구현 |
+| tester | 테스트 작성/실행 |
+| reviewer | 코드 리뷰, 보안 점검 |
+| deployer | 인프라/배포 검증 |
+
+에이전트 정의: `.claude/agents/*.md` / 오케스트레이터: `.claude/skills/orchestrator/SKILL.md`
+
 ## 절대 원칙
 
 | 원칙 | 근거 |
