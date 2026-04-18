@@ -118,25 +118,52 @@ CLAUDE_MD_RULES_CONTINUE = (
 )
 
 
-HARNESS_RULES_NEW = (
-    "- `.claude/agents/` 와 `.claude/skills/orchestrator/` 디렉터리를 **반드시** 생성하고\n"
-    "  이 프로젝트에 맞는 에이전트 팀을 구성:\n"
-    "    - `.claude/agents/architect.md` — 설계 담당. 프로젝트 구조·모듈 설계 결정.\n"
-    "    - `.claude/agents/coder.md` — 코드 구현 담당. 프로덕션 코드 작성/수정.\n"
-    "    - `.claude/agents/tester.md` — 테스트 작성·실행 담당.\n"
-    "    - `.claude/agents/reviewer.md` — 코드 리뷰·보안 점검 담당.\n"
-    "    - 프로젝트 특성에 따라 추가 에이전트 자유 정의 (예: data-collector, scheduler 등)\n"
-    "    - 각 에이전트 파일에는 YAML frontmatter(name, model: opus, description) +\n"
-    "      핵심 역할, 작업 원칙, 입출력 프로토콜, 팀 통신 프로토콜 포함\n"
-    "    - `.claude/skills/orchestrator/SKILL.md` — 에이전트 간 워크플로 조율.\n"
-    "      YAML frontmatter(name, description) + 워크플로 순서 + 팀 구성 테이블 포함\n"
-)
+def _write_harness(project_dir: str, name: str, description: str) -> None:
+    """프로젝트에 .claude/agents/ 와 .claude/skills/orchestrator/ 를 직접 생성.
+    Claude CLI 내부에서 .claude/ 쓰기가 차단되므로 워크플로에서 Python 으로 처리."""
+    agents_dir = os.path.join(project_dir, ".claude", "agents")
+    skills_dir = os.path.join(project_dir, ".claude", "skills", "orchestrator")
+    os.makedirs(agents_dir, exist_ok=True)
+    os.makedirs(skills_dir, exist_ok=True)
 
-HARNESS_RULES_CONTINUE = (
-    "- `.claude/agents/` 와 `.claude/skills/` 가 없으면 위 규칙대로 새로 생성.\n"
-    "  이미 있으면 이번 변경에 영향받는 에이전트/스킬만 업데이트.\n"
-    "  새 모듈이 추가되면 관련 에이전트의 전문 영역 섹션에 반영.\n"
-)
+    agents = {
+        "architect": ("설계 담당", "프로젝트 구조·모듈 설계, CLAUDE.md 유지"),
+        "coder": ("코드 구현 담당", "프로덕션 코드 작성/수정"),
+        "tester": ("테스트 담당", "테스트 작성·실행, 회귀 감지"),
+        "reviewer": ("코드 리뷰 담당", "코드 품질·보안 점검, LGTM 또는 이슈 리포트"),
+    }
+    for agent_name, (role, desc_detail) in agents.items():
+        path = os.path.join(agents_dir, f"{agent_name}.md")
+        if os.path.exists(path):
+            continue
+        with open(path, "w") as f:
+            f.write(
+                f"---\nname: {agent_name}\nmodel: opus\n"
+                f"description: \"{name} 프로젝트의 {desc_detail}\"\n---\n\n"
+                f"# {agent_name.title()} — {role}\n\n"
+                f"## 핵심 역할\n{name} 프로젝트에서 {desc_detail}.\n\n"
+                f"## 작업 원칙\n1. 기존 코드 스타일 유지\n"
+                f"2. CLAUDE.md 를 참고하여 프로젝트 맥락 파악\n"
+                f"3. 변경 시 영향 범위를 먼저 확인\n"
+            )
+
+    orchestrator_path = os.path.join(skills_dir, "SKILL.md")
+    if not os.path.exists(orchestrator_path):
+        with open(orchestrator_path, "w") as f:
+            f.write(
+                f"---\nname: orchestrator\n"
+                f"description: \"{name} 프로젝트의 에이전트 팀을 조율. "
+                f"멀티 에이전트 협업 필요 시 트리거.\"\n---\n\n"
+                f"# {name} Orchestrator\n\n"
+                f"## 팀 구성\n"
+                f"| 에이전트 | 역할 |\n|----------|------|\n"
+                f"| architect | 설계, CLAUDE.md 유지 |\n"
+                f"| coder | 코드 구현 |\n"
+                f"| tester | 테스트 작성/실행 |\n"
+                f"| reviewer | 코드 리뷰, 보안 점검 |\n\n"
+                f"## 워크플로\n"
+                f"architect → coder → tester → reviewer\n"
+            )
 
 
 NEW_PROJECT_PROMPT = (
@@ -151,7 +178,6 @@ NEW_PROJECT_PROMPT = (
     "- 작업이 끝나면 자동으로 docker compose 로 배포되므로 즉시 실행 가능한 상태여야 함\n"
     "- git 작업(add/commit/push) 은 자동 처리되므로 직접 실행하지 마세요\n"
     "{claude_md_rules}"
-    "{harness_rules}"
     "- 마지막에 한국어로 변경 내역을 3~5줄로 요약"
 )
 
@@ -166,7 +192,6 @@ CONTINUE_PROJECT_PROMPT = (
     "- 작업이 끝나면 자동으로 재배포되므로 즉시 실행 가능한 상태여야 함\n"
     "- git 작업(add/commit/push) 은 자동 처리되므로 직접 실행하지 마세요\n"
     "{claude_md_rules}"
-    "{harness_rules}"
     "- 마지막에 한국어로 변경 내역을 3~5줄로 요약"
 )
 
@@ -419,7 +444,6 @@ def build_workflow(
                 description=state.get("description", ""),
                 db_section=db_section,
                 claude_md_rules=CLAUDE_MD_RULES_NEW,
-                harness_rules=HARNESS_RULES_NEW,
             ) + plan_section
             resume = False
         else:
@@ -428,7 +452,6 @@ def build_workflow(
                 task=state["task"],
                 db_section=db_section,
                 claude_md_rules=CLAUDE_MD_RULES_CONTINUE,
-                harness_rules=HARNESS_RULES_CONTINUE,
             ) + plan_section
             resume = True
 
@@ -447,6 +470,20 @@ def build_workflow(
             "cli_result": result,
             "status": "cli_error" if result.is_error else "coded",
         }
+
+    async def setup_harness(state: WorkflowState) -> dict:
+        """코드 생성 후 .claude/agents/ 와 .claude/skills/ 를 직접 생성."""
+        cli = state.get("cli_result")
+        if cli is None or cli.is_error:
+            return {}
+        project: Project = state["project"]
+        project_dir = os.path.join(state["projects_dir"], project.name)
+        try:
+            _write_harness(project_dir, project.name, project.description)
+            logger.info(f"[harness] '{project.name}' 하네스 생성/갱신 완료")
+        except OSError as e:
+            logger.warning(f"[harness] '{project.name}' 하네스 생성 실패: {e}")
+        return {}
 
     async def review(state: WorkflowState) -> dict:
         """(sub-agent) 코드 리뷰. 비활성이면 noop."""
@@ -622,6 +659,7 @@ def build_workflow(
     g.add_node("provision_db", provision_db)
     g.add_node("plan", plan)
     g.add_node("code", code)
+    g.add_node("setup_harness", setup_harness)
     g.add_node("review", review)
     g.add_node("fix", fix)
     g.add_node("deploy", deploy)
@@ -637,7 +675,8 @@ def build_workflow(
         "provision_db", route_after_db, {"plan": "plan", "persist": "persist"}
     )
     g.add_edge("plan", "code")
-    g.add_edge("code", "review")
+    g.add_edge("code", "setup_harness")
+    g.add_edge("setup_harness", "review")
     g.add_edge("review", "fix")
     g.add_edge("fix", "deploy")
     g.add_edge("deploy", "github_sync")
